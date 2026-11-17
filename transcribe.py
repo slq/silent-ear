@@ -65,6 +65,11 @@ def log(*parts):
     print(*parts, file=sys.stderr, flush=True)
 
 
+def describe(exc):
+    """An exception as text; some (a bare assert) carry no message of their own."""
+    return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+
+
 # ---------------------------------------------------------------- capture ---
 
 class Source:
@@ -572,6 +577,56 @@ def transcribe_worker(jobs, transcribe, output, state, stop, speakers=None):
 
 # ---------------------------------------------------------------- devices ---
 
+def _accept_plain_mix_formats():
+    """Let soundcard open devices whose native format is not WAVE_FORMAT_EXTENSIBLE.
+
+    soundcard builds its stream format by editing the device's own "mix format"
+    and asserts that this is an extensible float one. Some devices (16-bit mono
+    USB headset microphones, for instance) report a plain format instead, and
+    opening them dies with a bare AssertionError. When that happens we hand
+    WASAPI a float32 format of our own: in shared mode, with the auto-convert
+    flags soundcard already sets, Windows converts from whatever the device uses.
+    """
+    import struct
+    import uuid
+    mf = sys.modules.get("soundcard.mediafoundation")
+    client = getattr(mf, "_AudioClient", None)
+    if client is None or getattr(client, "_plain_formats", False):
+        return
+    original = client.__init__
+    ieee_float = uuid.UUID("00000003-0000-0010-8000-00aa00389b71").bytes_le
+
+    def init(self, ptr, samplerate, channels, blocksize, isloopback, exclusive_mode=False):
+        try:
+            return original(self, ptr, samplerate, channels, blocksize, isloopback, exclusive_mode)
+        except AssertionError:
+            if exclusive_mode:
+                raise
+        self._ptr = ptr                 # nothing was initialised yet: the assert comes first
+        self.channelmap = list(range(channels)) if isinstance(channels, int) else list(channels)
+        count = len(set(self.channelmap))
+        if blocksize is None:
+            blocksize = self.deviceperiod[0] * samplerate
+        mask = {1: 0x4, 2: 0x3}.get(count, (1 << count) - 1)       # front centre / left + right
+        # WAVEFORMATEXTENSIBLE, packed as Windows lays it out (40 bytes).
+        wave_format = mf._ffi.new("char[]", struct.pack(
+            "<HHIIHHHHI", 0xFFFE, count, int(samplerate), int(samplerate) * count * 4,
+            count * 4, 32, 22, 32, mask) + ieee_float)
+        flags = 0x00100000 | 0x80000000 | 0x08000000 | 0x00080000   # as soundcard: convert, resample
+        if isloopback:
+            flags |= 0x00020000
+        duration = int(blocksize / samplerate * 10000000)
+        hr = ptr[0][0].lpVtbl.Initialize(
+            ptr[0], mf._ole32.AUDCLNT_SHAREMODE_SHARED, flags, duration, 0,
+            mf._ffi.cast("WAVEFORMATEXTENSIBLE*", wave_format), mf._ffi.NULL)
+        mf._com.check_error(hr)
+        self.samplerate = samplerate
+        self._idle_start_time = None
+
+    client.__init__ = init
+    client._plain_formats = True
+
+
 def load_soundcard():
     try:
         import soundcard
@@ -580,6 +635,11 @@ def load_soundcard():
     except Exception as exc:  # e.g. no audio server on Linux
         sys.exit(f"Could not initialise audio: {exc}")
     warnings.filterwarnings("ignore", category=soundcard.SoundcardRuntimeWarning)
+    if sys.platform == "win32":
+        try:
+            _accept_plain_mix_formats()
+        except Exception as exc:    # soundcard changed inside: its own behaviour stays
+            log(f"Could not extend audio device support: {exc}")
     return soundcard
 
 
@@ -654,7 +714,8 @@ def parse_args(argv=None):
     p.add_argument("--language", default="en",
                    help="spoken language as an ISO code, e.g. en or de; 'auto' to detect (default: en)")
     p.add_argument("--prompt", help="context hint such as names or jargon (support varies by model)")
-    p.add_argument("-o", "--output", help="transcript file (default: transcript-<time>.txt; '-' for none)")
+    p.add_argument("-o", "--output",
+                   help="transcript file (default: transcripts/transcript-<time>.txt; '-' for none)")
     p.add_argument("--timestamps", action="store_true", help="prefix each line with the clock time")
     p.add_argument("--save-audio", metavar="FILE.wav", help="also keep the mixed recording")
     p.add_argument("--mic", help="microphone name (substring is enough)")
@@ -739,7 +800,10 @@ def main(argv=None):
             log(f"Speaker detection off: {exc}")
 
     started_at = datetime.now()
-    out_path = None if args.output == "-" else (args.output or f"transcript-{started_at:%Y%m%d-%H%M%S}.txt")
+    out_path = None if args.output == "-" else args.output
+    if args.output is None:             # next to the sessions the UI keeps
+        os.makedirs("transcripts", exist_ok=True)
+        out_path = os.path.join("transcripts", f"transcript-{started_at:%Y%m%d-%H%M%S}.txt")
     output = Output(out_path, args.timestamps, started_at)
     recording = None
     if args.save_audio:
@@ -776,7 +840,7 @@ def main(argv=None):
             for source in sources:
                 if source.error and not source.reported:
                     source.reported = True
-                    log(f"{source.label} capture stopped: {source.error}")
+                    log(f"{source.label} capture stopped: {describe(source.error)}")
             if all(source.error for source in sources):
                 state["fatal"] = state["fatal"] or RuntimeError("all audio sources failed")
                 break

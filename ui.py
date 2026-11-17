@@ -10,7 +10,7 @@ Usage
     python ui.py --port 9000 --dir D:\\meetings
     python ui.py --language pl --min-chunk 2 --max-chunk 12   # transcribe.py options work too
 
-Every recording is a session, kept as two files in --dir:
+Every recording is a session, kept as files in --dir (default: the "transcripts" subfolder):
     transcript-<time>[-<title>].json   the source of truth, written to be readable
                                        by a person or a language model on its own
     transcript-<time>[-<title>].txt    the plain text, rewritten after every change
@@ -735,6 +735,7 @@ class Engine:
         self.error = None
         self.session = None
         self.replaying = False          # the running "recording" is fed from a saved file
+        self.source_errors = []         # devices that failed during the current recording
         self.stop_event = None
         self.worker = None
         self.lock = threading.Lock()
@@ -845,6 +846,7 @@ class Engine:
         if hasattr(self.transcribe, "context"):
             self.transcribe.context = ""
         stop, jobs = threading.Event(), queue.Queue()
+        self.source_errors = []
         chunker = core.Chunker(min_s=self.args.min_chunk, max_s=self.args.max_chunk,
                                pause_s=self.args.pause)
         self.stop_event, self.session, self.phase = stop, session["id"], "recording"
@@ -890,6 +892,7 @@ class Engine:
                 core.log(f"Speaker detection off: {exc}")
         if hasattr(self.transcribe, "context"):
             self.transcribe.context = ""
+        self.source_errors = []
         stop, jobs = threading.Event(), queue.Queue(maxsize=4)     # bounded: the file outruns the model
         self.stop_event, self.session, self.replaying = stop, session["id"], True
         self.phase = "recording"
@@ -1044,7 +1047,11 @@ class Engine:
             for source in sources:
                 if source.error and not source.reported:
                     source.reported = True
-                    self.hub.send(type="notice", text=f"{source.label} capture stopped: {source.error}")
+                    name = {"Mic": "The microphone", "System": "System audio"}.get(source.label, source.label)
+                    problem = f"{name} ({source.device.name}) is not being recorded: {core.describe(source.error)}"
+                    self.source_errors.append(problem)
+                    core.log(problem)
+                    self.hub.send(type="notice", text=problem)
             if all(source.error for source in sources):
                 self.hub.send(type="notice", text="Recording stopped: all audio sources failed.")
                 stop.set()
@@ -1106,8 +1113,9 @@ class Engine:
             self.store.align(sid)       # a title given while recording now reaches the file name
         elif not dead:                  # say why the transcript that was on screen is gone
             what = "the saved recording" if self.replaying else "the recording"
+            why = " ".join(self.source_errors)      # a source that failed is the likely reason
             self.hub.send(type="notice", text=f"No speech was recognised in {what}, "
-                                              "so no transcript was kept.")
+                                              "so no transcript was kept." + (" " + why if why else ""))
         with self.lock:
             self.phase, self.session, self.replaying = "idle", None, False
         self._changed()
@@ -1358,7 +1366,9 @@ def main(argv=None):
         epilog="Options of transcribe.py (--language, --backend, --model, --mic, --no-speakers, "
                "--mic-speakers, --min-chunk, --max-chunk, --pause, --timestamps, ...) are accepted too.")
     p.add_argument("--port", type=int, default=8765)
-    p.add_argument("--dir", default=".", help="folder holding the transcripts (default: current)")
+    p.add_argument("--dir", default="transcripts",
+                   help="folder holding the transcripts, recordings, dictionary and settings "
+                        "(default: transcripts)")
     p.add_argument("--no-browser", action="store_true", help="don't open the page automatically")
     own, rest = p.parse_known_args(argv)
     args = core.parse_args(rest)

@@ -1,4 +1,5 @@
 # Everything the tool produces is private: what was said, who said it, and the audio.
+transcripts/
 transcript-*
 *.wav
 trash/
