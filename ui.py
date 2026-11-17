@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["soundcard>=0.4.3", "numpy", "requests", "faster-whisper", "sherpa-onnx"]
+# dependencies = ["soundcard>=0.4.3", "numpy", "requests", "faster-whisper", "sherpa-onnx", "anthropic"]
 # ///
 """Browser UI for transcribe.py: live transcript, speaker names, editing, dictionary.
 
@@ -71,8 +71,51 @@ ABOUT = (
     "offset is its position in the file. "
     "'source_file', when set, is the audio or video file this transcript was imported from; "
     "'started' is then an estimate (the file's date minus its length) and every voice is on the "
-    "single channel 'uploaded file'."
+    "single channel 'uploaded file'. "
+    "'summary', when present, was written by a language model from an earlier state of this "
+    "transcript; the entries are the source of truth."
 )
+
+
+SUMMARY_MODEL = "claude-opus-5-5"
+# Models whose safety refusals the API can hand to another model inside the same request.
+SUMMARY_FALLBACK_MODELS = {"claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5",
+                           "claude-opus-5", "claude-sonnet-5-5"}
+# US dollars per million tokens (input, output), November 2026: only for the estimate shown.
+SUMMARY_PRICES = {"claude-opus-5-5": (4.0, 20.0), "claude-sonnet-5-5": (2.0, 10.0),
+                  "claude-haiku-5-5": (0.1, 0.5), "claude-fable-5-2": (8.0, 40.0)}
+SUMMARY_SYSTEM = """\
+You write the minutes of a recorded conversation from its automatic transcript, for the \
+people who were in it and for people who were not.
+
+The transcript comes from speech recognition. Expect misheard words, especially names and \
+jargon, and sentences split across lines; read through such errors instead of repeating \
+them, and take the spelling of terms from the glossary when one is given. Speakers listed \
+as automatic voice labels ("Speaker 2", "Mic 1") were told apart by voice alone: one person \
+may appear under two labels and two people may share one. Refer to them by their label and \
+do not guess who they are. "You" is the person who made the recording.
+
+Write in the language most of the conversation is in, headings included. Use Markdown with \
+these sections, leaving out any that would be empty:
+
+## Summary
+A short paragraph: what this conversation was and where it ended up.
+
+## Key points
+The substance, grouped by topic.
+
+## Decisions
+What was agreed, with who decided or agreed where the transcript shows it.
+
+## Action items
+One per line as "Owner: task (deadline)". Write "Owner unclear" when the transcript does not say.
+
+## Open questions
+What was raised and left unresolved.
+
+Report only what the transcript supports. Where a passage is too garbled to be sure of, say \
+so instead of filling the gap. Format with headings, bullet lists and bold only (no tables), \
+and start directly with the first heading."""
 
 
 class Busy(Exception):
@@ -261,6 +304,7 @@ def new_session(sid, started, title=None, model=None, sources=None, source_file=
     return {"id": sid, "title": title or started.strftime("%Y-%m-%d %H:%M"),
             "started": started.isoformat(timespec="seconds"),
             "model": model, "sources": sources, "source_file": source_file, "audio": [],
+            "summary": None,
             "names": {}, "entries": [], "next": 1}
 
 
@@ -308,6 +352,42 @@ def render(session, timestamps=False):
     return "\n".join(lines) + "\n" if lines else ""
 
 
+def summary_prompt(session, dictionary=None):
+    """What the summarising model is given: the facts about the conversation, then
+    the transcript as plain lines. Much smaller than the .json for the same content."""
+    started = datetime.fromisoformat(session["started"])
+    entries = session["entries"]
+    times = [e["t"] for e in entries if e["t"] is not None]
+    head = [f"Title: {session['title']}",
+            f"Date: {started:%A %Y-%m-%d}, started {started:%H:%M}"
+            + (f", about {max(1, round(max(times) / 60))} minutes" if times else "")]
+    if session.get("source_file"):
+        head.append(f"Source: imported from the file {session['source_file']}; "
+                    "the date is an estimate")
+    elif session.get("sources"):
+        both = len(session["sources"]) > 1
+        head.append("Source: live recording of " + ("a microphone and the computer's audio "
+                    "(a call: people in the room and remote participants)" if both else "one audio source"))
+    head.append("Speakers:")
+    for key, name in session["names"].items():
+        count = sum(1 for e in entries if e["speaker"] == key)
+        if count:
+            kind = ("the person who made the recording" if name == "You" else
+                    "automatic voice label" if AUTO_RE.fullmatch(name) else "named by the user")
+            channel = channel_of(key, session.get("sources"))
+            head.append(f"- {name} ({kind}{', ' + channel if channel else ''}; {count} lines)")
+    languages = sorted({e["language"] for e in entries if e.get("language")})
+    glossary = dictionary.glossary(languages) if dictionary else []
+    if glossary:
+        head.append("Glossary (correct spellings): " + ", ".join(glossary))
+    lines = []
+    for e in entries:
+        clock = "" if e["t"] is None else f"[{started + timedelta(seconds=e['t']):%H:%M:%S}] "
+        name = display_name(session, e)
+        lines.append(f"{clock}{name + ': ' if name else ''}{e['text']}")
+    return "\n".join(head) + "\n\nTranscript:\n" + "\n".join(lines)
+
+
 def to_file(session, dictionary=None):
     """The .json as written to disk: the session plus everything a reader who
     has only this file needs (resolved names, clock times, who is who)."""
@@ -340,6 +420,7 @@ def to_file(session, dictionary=None):
         "source_file": session.get("source_file"),
         "audio": session.get("audio", []),
         "glossary": dictionary.glossary(languages) if dictionary else [],
+        "summary": session.get("summary"),
         "speakers": speakers,
         "entries": entries,
         "next": session["next"],
@@ -359,6 +440,8 @@ def from_file(data):
                           data.get("recognition_model"), data.get("audio_sources"),
                           data.get("source_file"))
     session["names"] = {s["id"]: s["name"] for s in data.get("speakers", [])}
+    if isinstance(data.get("summary"), dict) and data["summary"].get("text"):
+        session["summary"] = data["summary"]
     for item in data.get("audio") or []:
         name = item.get("file") if isinstance(item, dict) else None
         if isinstance(name, str) and name == os.path.basename(name) and name.endswith(".wav"):
@@ -524,6 +607,14 @@ class Store:
                 audio.append({"file": name, "offset": item["offset"], "channels": item.get("channels")})
             self.set_audio(sid, audio)
             return audio
+
+    def set_summary(self, sid, summary):
+        """Store a summary with the session, or remove it (None)."""
+        with self.lock:
+            session = self.load(sid)
+            session["summary"] = summary
+            self.save(session)
+            return session
 
     def set_audio(self, sid, audio):
         with self.lock:
@@ -1121,14 +1212,130 @@ class Engine:
         self._changed()
 
 
+# ---------------------------------------------------------------- summary ---
+
+class Summarizer:
+    """Writes the minutes of a session with Claude, through the Anthropic API.
+
+    This is the one part of the tool that sends anything off the machine: the
+    transcript text (never the audio) goes to the API. The key is read from the
+    environment (ANTHROPIC_API_KEY) by the SDK.
+    """
+
+    def __init__(self, store, dictionary, hub, model=SUMMARY_MODEL):
+        self.store, self.dictionary, self.hub, self.model = store, dictionary, hub, model
+        self.running = set()
+        self.lock = threading.Lock()
+
+    def _client(self):
+        try:
+            import anthropic
+        except ImportError:
+            raise Busy("Summaries need the Anthropic SDK. Run: pip install anthropic")
+        try:
+            return anthropic, anthropic.Anthropic()
+        except Exception as exc:
+            raise Busy(f"Could not set up the Anthropic client: {core.describe(exc)}")
+
+    def start(self, sid):
+        session = self.store.load(sid)
+        if not session["entries"]:
+            raise Busy("There is nothing to summarise yet.")
+        anthropic, client = self._client()
+        with self.lock:
+            if sid in self.running:
+                raise Busy("A summary of this transcript is already being written.")
+            self.running.add(sid)
+        prompt = summary_prompt(session, self.dictionary)
+        threading.Thread(target=self._run, daemon=True,
+                         args=(anthropic, client, sid, prompt, len(session["entries"]))).start()
+        self.hub.send(type="changed")
+
+    def _request(self, client, prompt):
+        """The streaming request; a context manager yielding the SDK's stream."""
+        request = dict(
+            model=self.model,
+            max_tokens=32000,                       # room for the reasoning as well as the minutes
+            system=SUMMARY_SYSTEM,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "medium"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+        if self.model in SUMMARY_FALLBACK_MODELS:
+            # If the model's safety checks decline the request, the API retries it on
+            # another model inside the same call instead of returning nothing.
+            return client.beta.messages.stream(
+                betas=["server-side-fallback-2026-07-01"], fallbacks="default", **request)
+        return client.messages.stream(**request)
+
+    def _run(self, anthropic, client, sid, prompt, lines):
+        error = None
+        try:
+            with self._request(client, prompt) as stream:
+                for text in stream.text_stream:
+                    self.hub.send(type="summary", session=sid, delta=text)
+                message = stream.get_final_message()
+            if message.stop_reason == "refusal":
+                raise Busy("The model declined to summarise this transcript.")
+            text = "".join(block.text for block in message.content if block.type == "text").strip()
+            if not text:
+                raise Busy("The model returned an empty summary.")
+            if message.stop_reason == "max_tokens":
+                text += "\n\n(The summary was cut off at the length limit.)"
+            usage = {"input_tokens": message.usage.input_tokens,
+                     "output_tokens": message.usage.output_tokens}
+            price = SUMMARY_PRICES.get(message.model) or SUMMARY_PRICES.get(self.model)
+            cost = None
+            if price:
+                cost = round((usage["input_tokens"] * price[0] + usage["output_tokens"] * price[1]) / 1e6, 4)
+            self.store.set_summary(sid, {
+                "text": text, "model": message.model,
+                "created": datetime.now().isoformat(timespec="seconds"),
+                "entries_summarised": lines, "usage": usage, "estimated_cost_usd": cost})
+        except Busy as exc:
+            error = str(exc)
+        except KeyError:
+            error = "The transcript was renamed or removed while it was being summarised."
+        except anthropic.AuthenticationError:
+            error = ("No valid Anthropic API key. Set the ANTHROPIC_API_KEY environment "
+                     "variable and restart ui.py.")
+        except anthropic.PermissionDeniedError as exc:
+            error = f"The API key is not allowed to use {self.model}: {exc.message}"
+        except anthropic.NotFoundError:
+            error = f"The model {self.model} is not available to this API key."
+        except anthropic.RateLimitError:
+            error = "The API rate limit was reached. Try again in a minute."
+        except anthropic.APIStatusError as exc:
+            error = f"The API returned an error ({exc.status_code}): {exc.message}"
+        except anthropic.APIConnectionError:
+            error = "Could not reach the Anthropic API. Check the internet connection."
+        except Exception as exc:
+            if "authentication method" in str(exc):     # the SDK found no credentials at all
+                error = ("No Anthropic API key was found. Set the ANTHROPIC_API_KEY environment "
+                         "variable and restart ui.py.")
+            else:
+                error = core.describe(exc)
+        finally:
+            with self.lock:
+                self.running.discard(sid)
+        if error:
+            core.log(f"Summary of {sid} failed: {error}")
+        self.hub.send(type="summary", session=sid, done=True, error=error)
+        self.hub.send(type="changed")
+
+
 # ------------------------------------------------------------------- http ---
 
 class App:
-    def __init__(self, engine, store, dictionary, hub):
+    def __init__(self, engine, store, dictionary, hub, summarizer=None):
         self.engine, self.store, self.dictionary, self.hub = engine, store, dictionary, hub
+        self.summarizer = summarizer or Summarizer(store, dictionary, hub)
 
     def state(self):
+        with self.summarizer.lock:
+            running = sorted(self.summarizer.running)
         return {"status": self.engine.status(), "sessions": self.store.summaries(),
+                "summary": {"model": self.summarizer.model, "running": running},
                 "dictionary": self.dictionary.lists,
                 "languages": [{"code": c, "name": n} for c, n in LANGUAGES]}
 
@@ -1176,6 +1383,11 @@ class App:
                 self._not_recording([sid])
                 store.trash(sid)
                 result = {}
+        elif len(parts) == 3 and parts[2] == "summary" and method == "POST":
+            self.summarizer.start(parts[1])
+            return {}
+        elif len(parts) == 3 and parts[2] == "summary" and method == "DELETE":
+            result = store.set_summary(parts[1], None)
         elif len(parts) == 3 and parts[2] == "replay" and method == "POST":
             return {"session": engine.replay(parts[1])["id"]}
         elif len(parts) == 3 and parts[2] == "apply-dictionary" and method == "POST":
@@ -1370,6 +1582,9 @@ def main(argv=None):
                    help="folder holding the transcripts, recordings, dictionary and settings "
                         "(default: transcripts)")
     p.add_argument("--no-browser", action="store_true", help="don't open the page automatically")
+    p.add_argument("--summary-model", default=SUMMARY_MODEL,
+                   help=f"Claude model that writes summaries (default: {SUMMARY_MODEL}); "
+                        "needs ANTHROPIC_API_KEY in the environment")
     own, rest = p.parse_known_args(argv)
     args = core.parse_args(rest)
 
@@ -1387,7 +1602,8 @@ def main(argv=None):
                 pass
     engine = Engine(args, sc, store, dictionary, hub)
     server = Server(("127.0.0.1", own.port), Handler)
-    server.app = App(engine, store, dictionary, hub)
+    server.app = App(engine, store, dictionary, hub,
+                     Summarizer(store, dictionary, hub, own.summary_model))
     threading.Thread(target=engine.load, daemon=True).start()
 
     url = f"http://127.0.0.1:{own.port}"

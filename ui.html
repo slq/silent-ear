@@ -59,6 +59,17 @@
   #title:hover, #title:focus { border-color: var(--line); background: var(--panel); }
   #file { color: var(--muted); font-size: 12px; max-width: 45%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   header label { white-space: nowrap; }
+  #summary { margin: 6px 20px; padding: 10px 14px; background: var(--panel); border: 1px solid var(--line);
+             border-radius: 8px; max-height: 45%; overflow-y: auto; flex: none; }
+  #summary[hidden] { display: none; }
+  #summary .bar { margin: 0 0 4px; align-items: center; position: sticky; top: -10px; background: var(--panel); padding: 4px 0; }
+  #summary .bar button { font-size: 12px; padding: 1px 8px; }
+  #summary-meta { color: var(--muted); font-size: 12px; }
+  #summary-text h3 { font-size: 15px; margin: 12px 0 4px; }
+  #summary-text h4 { font-size: 14px; margin: 10px 0 2px; }
+  #summary-text p { margin: 4px 0; }
+  #summary-text ul { margin: 2px 0; padding-left: 22px; }
+  #summary-text li.sub { margin-left: 18px; }
   #player { margin: 4px 20px; height: 36px; width: calc(100% - 40px); flex: none; }
   #player[hidden] { display: none; }
   .row.playing { background: hsl(var(--h) 60% 55% / .16); }
@@ -128,10 +139,23 @@
   <div id="head">
     <input id="title" aria-label="Transcript title" placeholder="Name this transcript">
     <button id="rename" title="Rename this transcript; the files are renamed to match">Rename</button>
+    <button id="summarise" title="Write a summary with decisions and action items. Sends the transcript text to the Anthropic API.">Summarise</button>
     <button id="replay" hidden title="Transcribe the saved recording again into a new transcript, with the language, dictionary and speaker settings selected now. This one stays as it is.">Re-transcribe</button>
     <span id="file"></span>
   </div>
   <audio id="player" controls preload="metadata" hidden></audio>
+  <section id="summary" hidden>
+    <div class="bar">
+      <b>Summary</b>
+      <span id="summary-meta"></span>
+      <span class="spacer"></span>
+      <button id="summary-copy" title="Copy the summary as Markdown">Copy</button>
+      <button id="summary-redo" title="Write it again from the transcript as it is now">Regenerate</button>
+      <button id="summary-remove" title="Delete the summary">Remove</button>
+      <button id="summary-hide" title="Hide the summary">✕</button>
+    </div>
+    <div id="summary-text"></div>
+  </section>
   <div id="log"></div>
   <div id="live"></div>
 </main>
@@ -665,11 +689,108 @@ player.ontimeupdate = () => {
   if (current && (!player.paused || player.currentTime > 0)) current.classList.add('playing');
 };
 
+// ------------------------------------------------------------- summary ---
+
+const drafts = {};        // summaries being written, by session id, as the text streams in
+const shownSummaries = new Set();
+
+function inlineMarkdown(parent, text) {
+  for (const part of text.split(/(\*\*[^*]+\*\*)/)) {
+    if (part.length > 4 && part.startsWith('**') && part.endsWith('**')) parent.append(el('strong', '', part.slice(2, -2)));
+    else if (part) parent.append(part);
+  }
+}
+
+// Headings, bullets and bold are all the summary uses. Built node by node, so
+// nothing the model writes is ever treated as HTML.
+function renderMarkdown(target, text) {
+  target.replaceChildren();
+  let list = null;
+  for (const raw of text.split('\n')) {
+    const line = raw.trimEnd();
+    const heading = /^(#{1,4})\s+(.*)$/.exec(line);
+    const bullet = /^(\s*)(?:[-*•]|\d+[.)])\s+(.*)$/.exec(line);
+    if (heading) {
+      list = null;
+      inlineMarkdown(target.appendChild(el(heading[1].length <= 2 ? 'h3' : 'h4')), heading[2]);
+    } else if (bullet) {
+      if (!list) list = target.appendChild(el('ul'));
+      inlineMarkdown(list.appendChild(el('li', bullet[1].length >= 2 ? 'sub' : '')), bullet[2]);
+    } else if (!line.trim()) {
+      list = null;
+    } else {
+      list = null;
+      inlineMarkdown(target.appendChild(el('p')), line);
+    }
+  }
+}
+
+function summarising() {
+  return Boolean(session) && state.summary.running.includes(session.id);
+}
+
+function renderSummary() {
+  const box = $('#summary'), button = $('#summarise');
+  const running = summarising();
+  const saved = session && session.summary;
+  button.hidden = !session;
+  button.disabled = running || !session || !session.entries.length;
+  button.textContent = running ? 'Summarising…' : saved ? (shownSummaries.has(session.id) ? 'Hide summary' : 'Summary') : 'Summarise';
+  box.hidden = !(running || (saved && shownSummaries.has(session.id)));
+  if (box.hidden) return;
+  for (const id of ['#summary-copy', '#summary-redo', '#summary-remove']) $(id).disabled = running;
+  if (running) {
+    $('#summary-meta').textContent = `being written by ${state.summary.model}…`;
+    renderMarkdown($('#summary-text'), drafts[session.id] || '');
+    box.scrollTop = box.scrollHeight;
+    return;
+  }
+  const parts = [saved.model, new Date(saved.created).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })];
+  if (saved.estimated_cost_usd != null) parts.push(`about $${saved.estimated_cost_usd.toFixed(2)}`);
+  if (saved.entries_summarised !== session.entries.length) parts.push('the transcript has changed since');
+  $('#summary-meta').textContent = parts.join(' · ');
+  renderMarkdown($('#summary-text'), saved.text);
+}
+
+async function writeSummary() {
+  let agreed = false;
+  try { agreed = localStorage.getItem('summary-consent') === 'yes'; } catch (error) { /* storage blocked */ }
+  if (!agreed) {
+    if (!confirm('Summaries are written by Claude through the Anthropic API.\n\n' +
+                 'The text of this transcript will be sent there (never the audio), and the call is billed to your API key. Continue?')) return;
+    try { localStorage.setItem('summary-consent', 'yes'); } catch (error) { /* ask again next time */ }
+  }
+  drafts[session.id] = '';
+  shownSummaries.add(session.id);
+  await act('POST', `sessions/${session.id}/summary`);
+}
+
+$('#summarise').onclick = () => {
+  if (session.summary) {
+    shownSummaries.has(session.id) ? shownSummaries.delete(session.id) : shownSummaries.add(session.id);
+    renderSummary();
+  } else {
+    writeSummary();
+  }
+};
+$('#summary-hide').onclick = () => { shownSummaries.delete(session.id); renderSummary(); };
+$('#summary-redo').onclick = writeSummary;
+$('#summary-remove').onclick = () => { if (confirm('Delete this summary?')) act('DELETE', `sessions/${session.id}/summary`); };
+$('#summary-copy').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText(session.summary.text);
+    toast('Summary copied.');
+  } catch (error) {
+    toast('Could not copy: the browser blocked clipboard access.');
+  }
+};
+
 function render() {
   renderBar();
   renderSessions();
   renderTranscript();
   renderPlayer();
+  renderSummary();
 }
 
 // ---------------------------------------------------------- dictionary ---
@@ -773,6 +894,14 @@ events.onmessage = event => {
   } else if (message.type === 'progress') {
     progress = message;
     if (state) renderLive();
+  } else if (message.type === 'summary') {
+    if (message.delta) {
+      drafts[message.session] = (drafts[message.session] || '') + message.delta;
+      if (session && session.id === message.session && state && summarising()) renderSummary();
+    } else if (message.done) {
+      delete drafts[message.session];
+      if (message.error) toast('Summary failed: ' + message.error);
+    }
   } else if (message.type === 'notice') {
     toast(message.text);
   } else {
