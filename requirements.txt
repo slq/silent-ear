@@ -1,0 +1,6 @@
+soundcard>=0.4.3
+numpy
+requests
+faster-whisper
+sherpa-onnx
+anthropic
