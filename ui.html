@@ -1,0 +1,784 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Silent Ear</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --line: #e2dfd8; --ink: #1f1e1c; --muted: #76726a;
+    --accent: #2f5fd0; --danger: #c0392b; --hover: #f0eee9; --name-l: 38%;
+    font: 15px/1.5 system-ui, "Segoe UI", sans-serif; color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #17171a; --panel: #202024; --line: #33333a; --ink: #e9e7e2; --muted: #9a968d;
+            --accent: #7da2ff; --danger: #ff7b6b; --hover: #2a2a30; --name-l: 72%; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; height: 100vh; display: grid; grid-template: auto 1fr / 280px 1fr;
+         background: var(--bg); color: var(--ink); }
+  button, input, select { font: inherit; color: inherit; }
+  button { border: 1px solid var(--line); background: var(--panel); border-radius: 6px;
+           padding: 4px 10px; cursor: pointer; }
+  button:hover:not(:disabled) { background: var(--hover); }
+  button:disabled { opacity: .5; cursor: default; }
+  input, select { border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 4px 8px; }
+
+  header { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 10px 16px; min-width: 0;
+           background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0 8px 0 0; white-space: nowrap; }
+  #status { min-width: 80px; }
+  #record { min-width: 128px; font-weight: 600; }
+  #record.on { background: var(--danger); border-color: var(--danger); color: #fff; }
+  #status { color: var(--muted); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #status.error { color: var(--danger); }
+
+  aside { border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+  #sessions { flex: 1; overflow-y: auto; list-style: none; margin: 0; padding: 6px; }
+  #sessions li { display: flex; align-items: flex-start; gap: 8px; padding: 8px; border-radius: 6px; cursor: pointer; }
+  #sessions li:hover { background: var(--hover); }
+  #sessions li.open { background: var(--panel); box-shadow: inset 3px 0 var(--accent); }
+  #sessions .info { flex: 1; min-width: 0; }
+  #sessions .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #sessions .meta { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #sessions .live { color: var(--danger); }
+  #sessions .del { visibility: hidden; padding: 0 6px; border: 0; background: none; color: var(--muted); }
+  #sessions li:hover .del { visibility: visible; }
+  aside footer { padding: 8px; border-top: 1px solid var(--line); }
+  aside footer button { width: 100%; }
+  aside footer { display: grid; gap: 6px; }
+  body.dropping::after { content: "Drop audio or video files to transcribe them"; position: fixed; inset: 12px;
+    display: grid; place-items: center; font-size: 20px; color: var(--accent); background: rgb(127 127 127 / .18);
+    border: 3px dashed var(--accent); border-radius: 14px; pointer-events: none; z-index: 20; }
+  .empty { color: var(--muted); padding: 24px; }
+
+  main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  #head { display: flex; gap: 8px; padding: 12px 20px 4px; align-items: center; }
+  #head button { white-space: nowrap; flex: none; }
+  #title { flex: 1; min-width: 80px; font-size: 18px; font-weight: 600; border-color: transparent; background: none; }
+  #title:hover, #title:focus { border-color: var(--line); background: var(--panel); }
+  #file { color: var(--muted); font-size: 12px; max-width: 45%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  header label { white-space: nowrap; }
+  #player { margin: 4px 20px; height: 36px; width: calc(100% - 40px); flex: none; }
+  #player[hidden] { display: none; }
+  .row.playing { background: hsl(var(--h) 60% 55% / .16); }
+  .row time.play { cursor: pointer; }
+  .row time.play:hover { color: var(--accent); text-decoration: underline; }
+  #log { flex: 1; overflow-y: auto; padding: 4px 20px 24px; }
+  .turn { margin-top: 16px; }
+  .who { border: 0; background: none; padding: 0 4px; margin-left: 60px; font-weight: 700;
+         color: hsl(var(--h) 60% var(--name-l)); }
+  .who:hover { text-decoration: underline; }
+  .rename { margin-left: 60px; font-weight: 700; width: 220px; }
+  .row { display: flex; gap: 8px; padding: 2px 4px; border-radius: 4px; align-items: baseline;
+         border-left: 3px solid hsl(var(--h) 55% 55% / .55); }
+  .row:hover { background: var(--hover); }
+  .row time { flex: 0 0 52px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .row .text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .row .text[contenteditable] { outline: 2px solid var(--accent); border-radius: 4px; background: var(--panel); padding: 0 4px; }
+  .row { position: relative; }
+  .acts { display: none; gap: 4px; position: absolute; right: 4px; top: 1px; padding: 2px 4px;
+          background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+  .row:hover .acts { display: flex; }
+  .acts button, .acts select { font-size: 12px; padding: 0 6px; }
+  .acts select { max-width: 110px; }
+  #live { color: var(--muted); padding: 6px 20px 12px 84px; font-size: 13px; min-height: 34px; }
+  #live.on::before { content: "●"; color: var(--danger); margin-right: 8px; animation: blink 1.4s infinite; }
+  @keyframes blink { 50% { opacity: .25; } }
+
+  dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--ink);
+           width: min(680px, 92vw); padding: 20px; }
+  dialog::backdrop { background: rgb(0 0 0 / .4); }
+  dialog h2 { margin: 0 0 4px; font-size: 17px; }
+  dialog p { color: var(--muted); margin: 0 0 12px; font-size: 13px; }
+  #words { display: grid; grid-template-columns: 1fr 2fr auto; gap: 6px; align-items: center; }
+  #words b { font-size: 12px; color: var(--muted); font-weight: 600; }
+  #words input { width: 100%; }
+  .bar { display: flex; gap: 8px; margin-top: 14px; }
+  .bar .spacer { flex: 1; }
+  .primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #toast div + div { margin-top: 6px; padding-top: 6px; border-top: 1px solid rgb(127 127 127 / .4); }
+  #toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: var(--ink);
+           color: var(--bg); padding: 8px 14px; border-radius: 8px; max-width: 80vw; display: none; z-index: 10; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Silent Ear</h1>
+  <button id="record" disabled>Loading…</button>
+  <span id="status"></span>
+  <label title="Tell apart the people sharing your microphone as Mic 1, Mic 2, … instead of calling them all You. Applies from the next recording.">
+    <input type="checkbox" id="mic-speakers"> Several people on my mic</label>
+  <label title="Keep the recording as a WAV file next to the transcript (about 230 MB per hour with microphone and system audio). Applies from the next recording.">
+    <input type="checkbox" id="save-audio"> Save audio</label>
+  <label>Language <select id="language"></select></label>
+  <button id="dictionary">Dictionary</button>
+</header>
+
+<aside>
+  <ul id="sessions"></ul>
+  <footer>
+    <button id="import" title="Transcribe audio or video files (mp3, m4a, wav, mp4, mkv, webm, …). You can also drop files anywhere on this page.">Import audio or video…</button>
+    <input id="import-files" type="file" accept="audio/*,video/*,.mkv,.m4a,.opus,.flac" multiple hidden>
+    <button id="join" disabled>Join selected</button>
+  </footer>
+</aside>
+
+<main>
+  <div id="head">
+    <input id="title" aria-label="Transcript title" placeholder="Name this transcript">
+    <button id="rename" title="Rename this transcript; the files are renamed to match">Rename</button>
+    <button id="replay" hidden title="Transcribe the saved recording again into a new transcript, with the language, dictionary and speaker settings selected now. This one stays as it is.">Re-transcribe</button>
+    <span id="file"></span>
+  </div>
+  <audio id="player" controls preload="metadata" hidden></audio>
+  <div id="log"></div>
+  <div id="live"></div>
+</main>
+
+<dialog id="dict">
+  <h2>Dictionary</h2>
+  <p>The preferred spellings are given to the model as a hint before each chunk.
+     Anything listed under “heard as” is then always replaced in the text, whole words only,
+     ignoring case. Separate several variants with commas.</p>
+  <p><label>Word list for <select id="dict-language"></select></label>
+     <span id="dict-note"></span></p>
+  <div id="words"></div>
+  <div class="bar">
+    <button id="add-word">Add word</button>
+    <span class="spacer"></span>
+    <button id="apply-words" title="Save, then fix the lines already in the open transcript">Save and fix open transcript</button>
+    <button id="close-words">Cancel</button>
+    <button id="save-words" class="primary">Save</button>
+  </div>
+</dialog>
+<div id="toast"></div>
+
+<script>
+const $ = selector => document.querySelector(selector);
+const HUES = [215, 150, 25, 280, 340, 95, 185, 50];
+let state = null;         // /api/state
+let session = null;       // the open session, in full
+let openId = null;
+let picked = new Set();   // sessions ticked for joining
+let editing = false;      // an inline edit is open: don't redraw under it
+let stale = false;
+let progress = null;
+let lastTurn = null, lastName = null;
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text != null) node.textContent = text;
+  return node;
+}
+
+function button(label, title, onClick) {
+  const b = el('button', '', label);
+  b.title = title;
+  b.onclick = event => { event.stopPropagation(); onClick(); };
+  return b;
+}
+
+function toast(text) {      // messages stack: one must not wipe out the one before it
+  const box = $('#toast');
+  const line = el('div', '', text);
+  box.append(line);
+  box.style.display = 'block';
+  setTimeout(() => {
+    line.remove();
+    if (!box.children.length) box.style.display = 'none';
+  }, 7000);
+}
+
+async function api(method, path, body, quiet) {
+  const response = await fetch('/api/' + path, {
+    method,
+    headers: body ? {'Content-Type': 'application/json'} : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    if (!quiet) toast(data.error || response.statusText);
+    throw new Error(data.error || response.statusText);
+  }
+  return data;
+}
+
+async function refresh() {
+  if (editing) { stale = true; return; }
+  stale = false;
+  state = await api('GET', 'state');
+  const ids = state.sessions.map(s => s.id);
+  if (!ids.includes(openId)) openId = state.status.session || ids[0] || null;
+  picked = new Set([...picked].filter(id => ids.includes(id)));
+  if (followImport && state.status.session) {     // the import just became a transcript: show it
+    openId = state.status.session;
+    followImport = false;
+  } else if (state.status.phase === 'idle' && !uploading) {
+    followImport = false;                         // it failed or is already over
+  }
+  // A transcript can vanish between the two requests (an empty recording is dropped):
+  // that is not an error, so fall back to the newest one without a message.
+  session = openId ? await api('GET', 'sessions/' + openId, undefined, true).catch(() => null) : null;
+  if (!session && openId) {
+    openId = ids.find(id => id !== openId) || null;
+    session = openId ? await api('GET', 'sessions/' + openId, undefined, true).catch(() => null) : null;
+  }
+  if (!editing) render();
+  pumpImports();
+}
+
+// -------------------------------------------------------------- import ---
+
+let importQueue = [];     // files waiting their turn: the engine takes one at a time
+let uploading = false;
+let followImport = false;
+let banner = '';          // shown in place of the model name while a file is on its way in
+
+function showBanner(text) {
+  banner = text;
+  if (state && state.status.phase !== 'error') $('#status').textContent = text;
+}
+
+function queueImports(files) {
+  importQueue.push(...files);
+  pumpImports();
+  if (state) renderBar();
+}
+
+function pumpImports() {
+  if (uploading || !importQueue.length || !state || state.status.phase !== 'idle') return;
+  const file = importQueue.shift();
+  uploading = true;
+  const request = new XMLHttpRequest();
+  request.open('POST', '/api/import');
+  request.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+  request.setRequestHeader('X-File-Modified', String(file.lastModified || ''));
+  request.upload.onprogress = event => {
+    if (event.lengthComputable) showBanner(`Uploading ${file.name}… ${Math.round(100 * event.loaded / event.total)}%`);
+  };
+  request.onloadend = () => {
+    uploading = false;
+    if (request.status === 200) {
+      followImport = true;
+      showBanner(`Converting ${file.name}…`);
+    } else {
+      let reason = 'the connection failed';
+      try { reason = JSON.parse(request.responseText).error || reason; } catch (error) { /* not JSON */ }
+      toast(`Could not import ${file.name}: ${reason}`);
+    }
+    refresh();
+  };
+  showBanner(`Uploading ${file.name}…`);
+  request.send(file);
+}
+
+$('#import').onclick = () => $('#import-files').click();
+$('#import-files').onchange = event => {
+  queueImports([...event.target.files]);
+  event.target.value = '';
+};
+
+let dragDepth = 0;
+const hasFiles = event => [...(event.dataTransfer ? event.dataTransfer.types : [])].includes('Files');
+addEventListener('dragenter', event => { if (hasFiles(event)) { dragDepth++; document.body.classList.add('dropping'); } });
+addEventListener('dragleave', event => { if (hasFiles(event) && --dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dropping'); } });
+addEventListener('dragover', event => { if (hasFiles(event)) event.preventDefault(); });
+addEventListener('drop', event => {
+  if (!hasFiles(event)) return;
+  event.preventDefault();
+  dragDepth = 0;
+  document.body.classList.remove('dropping');
+  queueImports([...event.dataTransfer.files]);
+});
+
+async function act(method, path, body) {
+  const result = await api(method, path, body);
+  await refresh();
+  return result;
+}
+
+// ------------------------------------------------------------- top bar ---
+
+function renderBar() {
+  const { phase, error, model, language } = state.status;
+  const record = $('#record');
+  record.className = phase === 'recording' ? 'on' : '';
+  record.disabled = !(phase === 'idle' || phase === 'recording');
+  record.textContent = { loading: 'Loading model…', idle: '● Record', starting: 'Starting…', importing: 'Importing…',
+                         recording: '■ Stop', finishing: 'Finishing…', error: 'Unavailable' }[phase];
+  if (phase !== 'importing' && !uploading) banner = '';
+  const status = $('#status');
+  status.className = phase === 'error' ? 'error' : '';
+  status.textContent = phase === 'error' ? error : banner || model;
+  $('#import').disabled = phase === 'loading' || phase === 'error';
+  $('#import').textContent = importQueue.length ? `Import audio or video… (${importQueue.length} waiting)` : 'Import audio or video…';
+  status.title = status.textContent;
+
+  $('#mic-speakers').checked = state.status.mic_speakers;
+  $('#save-audio').checked = state.status.save_audio;
+
+  const select = $('#language');
+  if (document.activeElement !== select) {
+    const known = state.languages.some(l => l.code === language);
+    const options = known ? state.languages : [...state.languages, { code: language, name: language }];
+    select.replaceChildren(...options.map(l => {
+      const option = el('option', '', l.name);
+      option.value = l.code;
+      return option;
+    }));
+    select.value = language;
+  }
+  renderLive();
+}
+
+function renderLive() {
+  const live = $('#live');
+  const phase = state ? state.status.phase : '';
+  const here = session && state.status.session === session.id;
+  live.className = here && phase === 'recording' ? 'on' : '';
+  if (!here) { live.textContent = ''; return; }
+  const queued = progress && progress.queued ? ` · ${progress.queued} chunk(s) waiting for the model` : '';
+  if (phase === 'finishing') live.textContent = 'Transcribing the last audio…';
+  else if (state.status.replaying)
+    live.textContent = 'Transcribing the saved recording… ' + (progress && progress.replay != null ? Math.round(progress.replay * 100) + '% read' : '');
+  else if (progress && progress.buffered > 0) live.textContent = `Hearing speech — ${Math.round(progress.buffered)} s so far` + queued;
+  else live.textContent = 'Listening…' + queued;
+}
+
+$('#record').onclick = async () => {
+  if (state.status.phase === 'recording') return act('POST', 'record/stop');
+  $('#record').disabled = true;
+  $('#record').textContent = 'Starting…';
+  try {
+    const started = await api('POST', 'record/start');
+    openId = started.session;
+    progress = null;
+  } finally {
+    await refresh();
+  }
+};
+
+$('#language').onchange = event => {
+  event.target.blur();
+  act('POST', 'language', { language: event.target.value });
+};
+
+$('#save-audio').onchange = async event => {
+  await act('POST', 'settings', { save_audio: event.target.checked });
+  if (state.status.phase === 'recording') toast('Applies from the next recording.');
+};
+
+$('#mic-speakers').onchange = async event => {
+  await act('POST', 'settings', { mic_speakers: event.target.checked });
+  if (state.status.phase === 'recording') toast('Applies from the next recording.');
+};
+
+// ------------------------------------------------------------ sessions ---
+
+function renderSessions() {
+  const list = $('#sessions');
+  list.replaceChildren();
+  if (!state.sessions.length) list.append(el('li', 'empty', 'No transcripts yet. Press Record.'));
+  for (const s of state.sessions) {
+    const item = el('li', s.id === openId ? 'open' : '');
+    const tick = el('input');
+    tick.type = 'checkbox';
+    tick.checked = picked.has(s.id);
+    tick.title = 'Select for joining';
+    tick.onclick = event => event.stopPropagation();
+    tick.onchange = () => { tick.checked ? picked.add(s.id) : picked.delete(s.id); renderJoin(); };
+    const info = el('div', 'info');
+    info.append(el('div', 'title', s.title));
+    const meta = el('div', 'meta');
+    if (s.id === state.status.session) meta.append(el('span', 'live', '● recording · '));
+    meta.append(`${s.count} line${s.count === 1 ? '' : 's'}` + (s.speakers.length ? ' · ' + s.speakers.join(', ') : ''));
+    info.append(meta);
+    const remove = button('✕', 'Remove (moves the files to the trash folder)', async () => {
+      if (confirm(`Remove “${s.title}”?\nIts files are moved to the trash folder next to your transcripts.`))
+        await act('DELETE', 'sessions/' + s.id);
+    });
+    remove.className = 'del';
+    item.append(tick, info, remove);
+    item.onclick = () => { openId = s.id; refresh(); };
+    list.append(item);
+  }
+  renderJoin();
+}
+
+function renderJoin() {
+  const join = $('#join');
+  join.disabled = picked.size < 2;
+  join.textContent = picked.size < 2 ? 'Join selected' : `Join ${picked.size} selected`;
+}
+
+$('#join').onclick = async () => {
+  if (!confirm(`Join ${picked.size} transcripts into one, in time order?\nThe originals are moved to the trash folder.`)) return;
+  const merged = await api('POST', 'sessions/merge', { ids: [...picked] });
+  picked.clear();
+  openId = merged.id;
+  await refresh();
+};
+
+// ---------------------------------------------------------- transcript ---
+
+function nameOf(entry) {
+  return entry.speaker ? (session.names[entry.speaker] || entry.speaker) : null;
+}
+
+function clock(t) {
+  if (t == null) return '';
+  return new Date(Date.parse(session.started) + t * 1000).toLocaleTimeString([], { hour12: false });
+}
+
+function renderTranscript() {
+  const log = $('#log');
+  log.replaceChildren();
+  lastTurn = lastName = null;
+  $('#head').style.visibility = session ? 'visible' : 'hidden';
+  if (!session) { log.append(el('div', 'empty', 'Select a transcript, or press Record to start one.')); return; }
+  if (document.activeElement !== $('#title')) $('#title').value = session.title;
+  $('#file').textContent = session.id + '.txt';
+  if (!session.entries.length) log.append(el('div', 'empty', 'Nothing transcribed yet.'));
+  session.entries.forEach(appendEntry);
+  log.scrollTop = log.scrollHeight;
+}
+
+function appendEntry(entry) {
+  const log = $('#log');
+  const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+  const name = nameOf(entry);
+  if (!lastTurn || (name !== null && name !== lastName)) {
+    if (!lastTurn) log.replaceChildren();          // drop the "nothing yet" note
+    lastTurn = el('section', 'turn');
+    const index = Math.max(0, Object.keys(session.names).indexOf(entry.speaker));
+    lastTurn.style.setProperty('--h', HUES[index % HUES.length]);
+    if (name !== null) {
+      const who = el('button', 'who', name);
+      who.title = 'Rename this speaker everywhere in the transcript';
+      who.onclick = () => renameSpeaker(who, entry.speaker);
+      lastTurn.append(who);
+      lastName = name;
+    }
+    log.append(lastTurn);
+  }
+
+  const row = el('div', 'row');
+  const text = el('span', 'text', entry.text);
+  const acts = el('span', 'acts');
+  const base = `sessions/${session.id}/entries/${entry.id}`;
+  const join = button('Join ↑', 'Join with the line above', () => act('POST', base + '/join'));
+  join.disabled = session.entries[0] === entry;
+  acts.append(
+    button('Edit', 'Edit the text (Enter saves, Esc cancels)', () => editText(text, entry)),
+    join,
+    speakerPicker(entry, base),
+    button('Delete', 'Delete this line', () => { if (confirm('Delete this line?')) act('DELETE', base); }),
+  );
+  text.ondblclick = () => editText(text, entry);
+  const time = el('time', '', clock(entry.t));
+  if (entry.t != null) {
+    row.dataset.t = entry.t;
+    if (playable()) {
+      time.className = 'play';
+      time.title = 'Play the recording from here';
+      time.onclick = () => playFrom(entry.t);
+    }
+  }
+  row.append(time, text, acts);
+  lastTurn.append(row);
+  if (pinned) log.scrollTop = log.scrollHeight;
+}
+
+function speakerPicker(entry, base) {
+  const select = el('select');
+  select.title = 'Change who said this line';
+  const add = (value, label) => { const o = el('option', '', label); o.value = value; select.append(o); };
+  add('', '(no speaker)');
+  for (const [key, name] of Object.entries(session.names)) add(key, name);
+  add('\u0000new', 'New speaker…');
+  select.value = entry.speaker || '';
+  select.onchange = () => {
+    let speaker = select.value;
+    if (speaker === '\u0000new') {
+      speaker = (prompt('Name of the new speaker:') || '').trim();
+      if (!speaker) { select.value = entry.speaker || ''; return; }
+    }
+    act('PATCH', base, { speaker });
+  };
+  return select;
+}
+
+function finishEdit() {
+  editing = false;
+  refresh();          // also picks up anything that arrived meanwhile
+}
+
+function editText(span, entry) {
+  if (editing) return;
+  editing = true;
+  span.contentEditable = 'plaintext-only';
+  span.focus();
+  let done = false;
+  const close = async save => {
+    if (done) return;
+    done = true;
+    const value = span.textContent.replace(/\s+/g, ' ').trim();
+    try {
+      if (save && value && value !== entry.text)
+        await api('PATCH', `sessions/${session.id}/entries/${entry.id}`, { text: value });
+    } finally {
+      finishEdit();
+    }
+  };
+  span.onkeydown = event => {
+    if (event.key === 'Enter') { event.preventDefault(); close(true); }
+    else if (event.key === 'Escape') close(false);
+  };
+  span.onblur = () => close(true);
+}
+
+function renameSpeaker(label, key) {
+  if (editing) return;
+  editing = true;
+  const input = el('input', 'rename');
+  input.value = session.names[key] || key;
+  label.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const close = async save => {
+    if (done) return;
+    done = true;
+    const value = input.value.trim();
+    try {
+      if (save && value && value !== session.names[key])
+        await api('PATCH', 'sessions/' + session.id, { names: { [key]: value } });
+    } finally {
+      finishEdit();
+    }
+  };
+  input.onkeydown = event => {
+    if (event.key === 'Enter') close(true);
+    else if (event.key === 'Escape') close(false);
+  };
+  input.onblur = () => close(true);
+}
+
+$('#title').onchange = async event => {
+  if (!session || !event.target.value.trim()) return;
+  try {
+    const renamed = await api('PATCH', 'sessions/' + session.id, { title: event.target.value });
+    openId = renamed.id;        // the files, and so the id, follow the title
+  } finally {
+    await refresh();
+  }
+};
+$('#title').onkeydown = event => { if (event.key === 'Enter') event.target.blur(); };
+$('#rename').onclick = () => { $('#title').focus(); $('#title').select(); };
+
+// -------------------------------------------------------------- player ---
+
+const player = $('#player');
+let track = -1;           // which of the session's recordings is loaded
+let loaded = '';          // its URL, to leave a playing recording alone on redraws
+let mono = null;
+
+function tracks() {
+  return (session && session.audio) || [];
+}
+
+function playable() {     // not while it is still being recorded into
+  return tracks().length > 0 && state.status.session !== session.id;
+}
+
+function loadTrack(index, at, play) {
+  const url = `/api/sessions/${session.id}/audio/${index}`;
+  const start = () => { player.currentTime = at; if (play) player.play(); };
+  track = index;
+  if (loaded === url && player.readyState > 0) return start();
+  loaded = url;
+  player.src = url;
+  player.addEventListener('loadedmetadata', start, { once: true });
+}
+
+$('#replay').onclick = async () => {
+  const started = await api('POST', `sessions/${session.id}/replay`);
+  openId = started.session;
+  progress = null;
+  await refresh();
+  toast('Re-transcribing into a new transcript. The original is unchanged.');
+};
+
+function renderPlayer() {
+  $('#replay').hidden = !playable();
+  $('#replay').disabled = state.status.phase !== 'idle';
+  player.hidden = !playable();
+  if (!playable()) {
+    if (loaded) { player.pause(); player.removeAttribute('src'); player.load(); }
+    loaded = ''; track = -1;
+  } else if (!loaded.startsWith(`/api/sessions/${session.id}/audio/`)) {
+    loadTrack(0, 0, false);
+  }
+}
+
+function playFrom(t) {
+  const list = tracks();
+  let index = 0;          // the last recording that starts at or before t
+  list.forEach((item, i) => { if (item.offset <= t) index = i; });
+  loadTrack(index, Math.max(0, t - list[index].offset), true);
+}
+
+player.onplay = () => {
+  // Microphone and system audio are separate channels; fold them into both ears.
+  if (mono === null) {
+    try {
+      const context = new AudioContext();
+      const fold = context.createGain();
+      fold.channelCount = 1;
+      fold.channelCountMode = 'explicit';
+      fold.channelInterpretation = 'speakers';
+      context.createMediaElementSource(player).connect(fold).connect(context.destination);
+      mono = context;
+    } catch (error) {
+      mono = false;       // plays as it is: one source per ear
+    }
+  }
+  if (mono) mono.resume();
+};
+
+player.onended = () => {
+  if (track + 1 < tracks().length) loadTrack(track + 1, 0, true);
+};
+
+player.ontimeupdate = () => {
+  const list = tracks();
+  if (track < 0 || !list[track]) return;
+  const now = list[track].offset + player.currentTime;
+  let current = null;
+  for (const row of document.querySelectorAll('.row[data-t]')) {
+    const t = Number(row.dataset.t);
+    if (t >= list[track].offset - 0.05 && t <= now + 0.05) current = row;
+    row.classList.remove('playing');
+  }
+  if (current && (!player.paused || player.currentTime > 0)) current.classList.add('playing');
+};
+
+function render() {
+  renderBar();
+  renderSessions();
+  renderTranscript();
+  renderPlayer();
+}
+
+// ---------------------------------------------------------- dictionary ---
+
+function wordRow(entry) {
+  const term = el('input');
+  term.placeholder = 'Kubernetes';
+  term.value = entry.term;
+  const heard = el('input');
+  heard.placeholder = 'cooper netties, kubernetis';
+  heard.value = entry.heard.join(', ');
+  const remove = el('button', '', '✕');
+  remove.title = 'Remove this word';
+  remove.onclick = () => { term.remove(); heard.remove(); remove.remove(); };
+  $('#words').append(term, heard, remove);
+  return term;
+}
+
+let draft = {};           // every word list while the dialog is open, by language ("*" = all)
+let draftLanguage = '*';
+
+function readWords() {
+  const inputs = [...$('#words').querySelectorAll('input')];
+  const entries = [];
+  for (let i = 0; i < inputs.length; i += 2) {
+    const term = inputs[i].value.trim();
+    if (term) entries.push({ term, heard: inputs[i + 1].value.split(',').map(s => s.trim()).filter(Boolean) });
+  }
+  return entries;
+}
+
+function showWords(language) {
+  draftLanguage = language;
+  const entries = draft[language] || [];
+  $('#words').replaceChildren(el('b', '', 'Preferred spelling'), el('b', '', 'Heard as (always replaced)'), el('b'));
+  entries.forEach(wordRow);
+  if (!entries.length) wordRow({ term: '', heard: [] });
+  const current = state.status.language;
+  $('#dict-note').textContent = language === '*'
+    ? 'Used whatever the language is set to.'
+    : language === current ? 'In use now, together with the “All languages” list.'
+    : current === 'auto' ? 'Not in use while the language is on Auto-detect: only “All languages” is.'
+    : 'Used when the language is switched to this one.';
+}
+
+$('#dictionary').onclick = () => {
+  draft = JSON.parse(JSON.stringify(state.dictionary));
+  const select = $('#dict-language');
+  const options = [{ code: '*', name: 'All languages' }, ...state.languages.filter(l => l.code !== 'auto')];
+  for (const code of Object.keys(draft))
+    if (!options.some(l => l.code === code)) options.push({ code, name: code });
+  select.replaceChildren(...options.map(l => {
+    const count = (draft[l.code] || []).length;
+    const option = el('option', '', l.name + (count ? ` (${count})` : ''));
+    option.value = l.code;
+    return option;
+  }));
+  const current = state.status.language;
+  select.value = options.some(l => l.code === current) ? current : '*';
+  showWords(select.value);
+  $('#dict').showModal();
+};
+$('#dict-language').onchange = event => {
+  draft[draftLanguage] = readWords();       // keep the edits of the list being left
+  showWords(event.target.value);
+};
+$('#add-word').onclick = () => wordRow({ term: '', heard: [] }).focus();
+$('#close-words').onclick = () => $('#dict').close();
+
+async function saveWords() {
+  draft[draftLanguage] = readWords();
+  await api('PUT', 'dictionary', { dictionary: draft });
+  $('#dict').close();
+}
+
+$('#save-words').onclick = async () => { await saveWords(); await refresh(); toast('Dictionary saved. It applies from the next chunk.'); };
+$('#apply-words').onclick = async () => {
+  await saveWords();
+  if (!session) return refresh();
+  const result = await act('POST', `sessions/${session.id}/apply-dictionary`);
+  toast(`Dictionary saved. ${result.changed} line(s) fixed in the open transcript.`);
+};
+
+// -------------------------------------------------------------- events ---
+
+const events = new EventSource('/api/events');
+events.onopen = refresh;
+events.onmessage = event => {
+  const message = JSON.parse(event.data);
+  if (message.type === 'entry') {
+    const row = state && state.sessions.find(s => s.id === message.session);
+    if (row) row.count += 1;
+    if (session && message.session === session.id) {
+      session.names = message.names;
+      session.entries.push(message.entry);
+      appendEntry(message.entry);
+    }
+    if (!(state && state.status.replaying)) progress = null;
+  } else if (message.type === 'progress' && message.convert != null) {
+    showBanner(`Converting ${message.name}… ${Math.round(message.convert * 100)}%`);
+  } else if (message.type === 'progress') {
+    progress = message;
+    if (state) renderLive();
+  } else if (message.type === 'notice') {
+    toast(message.text);
+  } else {
+    refresh();
+  }
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+# Everything the tool produces is private: what was said, who said it, and the audio.
+transcript-*
+*.wav
+trash/
+
+# Personal word lists and UI switches
+dictionary.json
+settings.json
+
+# Uploads in progress
+.upload-*
+*.part
+
+# Other media that might be dropped here for import
+*.mp3
+*.mp4
+*.m4a
+*.mkv
+*.webm
+*.flac
+*.ogg
+*.opus
+*.mov
+
+# Python and tooling
+__pycache__/
+*.pyc
+.venv/
+venv/
+.claude/
+.idea/
+.vscode/
