@@ -21,6 +21,7 @@ to the "trash" subfolder, never deleted. dictionary.json holds the word lists
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import os
 import queue
@@ -53,7 +54,9 @@ LANGUAGES = [
     ("nl", "Dutch"), ("cs", "Czech"), ("sk", "Slovak"), ("uk", "Ukrainian"),
     ("sv", "Swedish"), ("ja", "Japanese"), ("zh", "Chinese"),
 ]
-PROMPT_TERMS_CHARS = 500    # Whisper keeps ~220 prompt tokens; leave room for the running context
+# The clean-up pass: pieces close to Whisper's 30-second window, still cut at a pause.
+CLEANUP_CHUNKS = {"min_s": 20.0, "max_s": 28.0, "pause_s": 0.5}
+PROMPT_TERMS_CHARS = 500   # Whisper keeps ~220 prompt tokens; leave room for the running context
 ABOUT = (
     "Transcript of a recorded conversation, produced by automatic speech recognition. "
     "'entries' are in the order they were spoken. In each entry 'speaker' is who said it, "
@@ -304,7 +307,7 @@ def new_session(sid, started, title=None, model=None, sources=None, source_file=
     return {"id": sid, "title": title or started.strftime("%Y-%m-%d %H:%M"),
             "started": started.isoformat(timespec="seconds"),
             "model": model, "sources": sources, "source_file": source_file, "audio": [],
-            "summary": None,
+            "summary": None, "cleaned": None,
             "names": {}, "entries": [], "next": 1}
 
 
@@ -421,6 +424,7 @@ def to_file(session, dictionary=None):
         "audio": session.get("audio", []),
         "glossary": dictionary.glossary(languages) if dictionary else [],
         "summary": session.get("summary"),
+        "cleaned_up": session.get("cleaned"),
         "speakers": speakers,
         "entries": entries,
         "next": session["next"],
@@ -442,6 +446,7 @@ def from_file(data):
     session["names"] = {s["id"]: s["name"] for s in data.get("speakers", [])}
     if isinstance(data.get("summary"), dict) and data["summary"].get("text"):
         session["summary"] = data["summary"]
+    session["cleaned"] = data.get("cleaned_up")
     for item in data.get("audio") or []:
         name = item.get("file") if isinstance(item, dict) else None
         if isinstance(name, str) and name == os.path.basename(name) and name.endswith(".wav"):
@@ -607,6 +612,65 @@ class Store:
                 audio.append({"file": name, "offset": item["offset"], "channels": item.get("channels")})
             self.set_audio(sid, audio)
             return audio
+
+    def replace_entries(self, sid, fresh):
+        """Swap in a new transcription of the same recording, keeping who is who.
+
+        `fresh` is a list of {"t", "speaker", "text", "language"}. Its speaker
+        labels come from a new run of the voice clustering, so "Speaker 2" there
+        need not be the old "Speaker 2". Each new label takes over the old
+        speaker that was talking at the same moments, by majority of words;
+        names the user gave carry over that way. A copy of the old version goes
+        to the trash folder first. Returns (lines before, lines after).
+        """
+        with self.lock:
+            session = self.load(sid)
+            before = len(session["entries"])
+            bin_dir = os.path.join(self.dir, "trash")
+            os.makedirs(bin_dir, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            write_json(os.path.join(bin_dir, f"{sid}.before-cleanup-{stamp}.json"),
+                       to_file(session, self.dictionary))
+
+            old = sorted((e for e in session["entries"] if e["t"] is not None), key=lambda e: e["t"])
+            times = [e["t"] for e in old]
+            def local(key):             # heard on the microphone, as opposed to the call
+                return key == "You" or bool(re.fullmatch(r"Mic \d+", key))
+
+            votes = {}
+            for entry in fresh:
+                if entry["speaker"] and old:
+                    was = old[max(bisect.bisect_right(times, entry["t"] + 1.5) - 1, 0)]["speaker"]
+                    if was and local(was) != local(entry["speaker"]):
+                        was = None      # the two sides of a call never stand for each other
+                    tally = votes.setdefault(entry["speaker"], {})
+                    tally[was] = tally.get(was, 0) + len(entry["text"].split())
+            mapping = {}
+            for label, tally in votes.items():
+                best = max(tally, key=tally.get)
+                if best is not None and tally[best] * 2 >= sum(tally.values()):
+                    mapping[label] = best
+            taken = set(session["names"]) | set(mapping.values())
+            for label in dict.fromkeys(e["speaker"] for e in fresh if e["speaker"]):
+                if label in mapping:
+                    continue
+                name = label                # a voice with no counterpart: must not inherit a name
+                if name in taken:
+                    prefix = label.rsplit(" ", 1)[0] if GENERIC_RE.fullmatch(label) else label
+                    number = 1
+                    while f"{prefix} {number}" in taken:
+                        number += 1
+                    name = f"{prefix} {number}"
+                mapping[label] = name
+                taken.add(name)
+
+            session["entries"] = []
+            for entry in fresh:
+                add_entry(session, entry["t"], mapping.get(entry["speaker"]), entry["text"],
+                          entry.get("language"))
+            session["cleaned"] = datetime.now().isoformat(timespec="seconds")
+            self.save(session)
+            return before, len(fresh)
 
     def set_summary(self, sid, summary):
         """Store a summary with the session, or remove it (None)."""
@@ -820,6 +884,8 @@ class Engine:
         saved = saved if isinstance(saved, dict) else {}
         self.mic_speakers = bool(args.mic_speakers or saved.get("mic_speakers"))
         self.save_audio = bool(saved.get("save_audio", True))
+        self.auto_cleanup = bool(saved.get("auto_cleanup", False))
+        self.cleaning = False           # the running pass rewrites an existing transcript
         self.transcribe = None
         self.model = ""
         self.phase = "loading"          # loading, idle, starting, recording, finishing, error
@@ -834,8 +900,9 @@ class Engine:
     def status(self):
         return {"phase": self.phase, "error": self.error, "model": self.model,
                 "language": self.language or "auto", "session": self.session,
-                "replaying": self.replaying,
-                "mic_speakers": self.mic_speakers, "save_audio": self.save_audio}
+                "replaying": self.replaying, "cleaning": self.cleaning,
+                "mic_speakers": self.mic_speakers, "save_audio": self.save_audio,
+                "auto_cleanup": self.auto_cleanup}
 
     def _changed(self):
         self.hub.send(type="changed")
@@ -874,8 +941,15 @@ class Engine:
 
     def refresh_prompt(self):
         """Hand the model the word list of the language now in force."""
+        self._use_language(self.language)
+
+    def _use_language(self, language):
+        """Point the model at a language and that language's word list."""
         if self.transcribe is not None:
-            parts = [p for p in (self.args.prompt, self.dictionary.prompt(self.language)) if p]
+            if self.transcribe.language != language and hasattr(self.transcribe, "context"):
+                self.transcribe.context = ""    # text in another language would pull it back
+            self.transcribe.language = language
+            parts = [p for p in (self.args.prompt, self.dictionary.prompt(language)) if p]
             self.transcribe.prompt = " ".join(parts) or None
 
     def set_language(self, code):
@@ -896,8 +970,11 @@ class Engine:
             self.mic_speakers = bool(body["mic_speakers"])
         if "save_audio" in body:
             self.save_audio = bool(body["save_audio"])
+        if "auto_cleanup" in body:
+            self.auto_cleanup = bool(body["auto_cleanup"])
         write_json(self.settings_path, {"mic_speakers": self.mic_speakers,
-                                        "save_audio": self.save_audio})
+                                        "save_audio": self.save_audio,
+                                        "auto_cleanup": self.auto_cleanup})
         self._changed()
 
     def start(self):
@@ -973,7 +1050,35 @@ class Engine:
         self._begin_replay(session, labels, audio)
         return session
 
-    def _begin_replay(self, session, labels, audio):
+    def cleanup(self, sid):
+        """Transcribe a session's recording again in long pieces and put the result
+        in place of its lines. Whole sentences reach the model together, so
+        punctuation is better and fewer sentences are cut in two. Speaker names
+        are carried over; the transcript changes only if the pass completes."""
+        with self.lock:
+            if self.phase != "idle":
+                raise Busy({"loading": "The model is still loading.",
+                            "error": self.error or "The model failed to load."}
+                           .get(self.phase, "Wait for the running recording or import to finish."))
+            self.phase = "starting"
+        try:
+            session = self.store.load(sid)
+            audio = [a for a in session["audio"] if os.path.isfile(os.path.join(self.store.dir, a["file"]))]
+            if not audio:
+                raise Busy("This transcript has no saved recording to clean up from.")
+            labels = audio[0].get("channels") or session.get("sources") or ["Mic", "System"]
+            # Each stretch is decoded in the language it was recorded in, when that is known.
+            known = sorted((e for e in session["entries"] if e["t"] is not None), key=lambda e: e["t"])
+            languages = None
+            if any(e.get("language") for e in known):
+                languages = ([e["t"] for e in known], [e.get("language") for e in known])
+        except Exception:
+            self.phase = "idle"
+            raise
+        self._begin_replay(session, labels, audio,
+                           cleanup={"entries": [], "languages": languages})
+
+    def _begin_replay(self, session, labels, audio, cleanup=None):
         """Start transcribing a session's saved recordings (phase is "starting" or "importing")."""
         speakers = None
         if not self.args.no_speakers:
@@ -986,13 +1091,16 @@ class Engine:
         self.source_errors = []
         stop, jobs = threading.Event(), queue.Queue(maxsize=4)     # bounded: the file outruns the model
         self.stop_event, self.session, self.replaying = stop, session["id"], True
+        self.cleaning = cleanup is not None
         self.phase = "recording"
         self.worker = threading.Thread(target=self._work, daemon=True,
-                                       args=(jobs, speakers, stop, session["id"]))
+                                       args=(jobs, speakers, stop, session["id"], cleanup))
         self.worker.start()
         parts = [(os.path.join(self.store.dir, a["file"]), a["offset"]) for a in audio]
+        chunking = CLEANUP_CHUNKS if cleanup is not None else dict(
+            min_s=self.args.min_chunk, max_s=self.args.max_chunk, pause_s=self.args.pause)
         threading.Thread(target=self._replay, daemon=True,
-                         args=(parts, len(labels), jobs, stop)).start()
+                         args=(parts, len(labels), jobs, stop, chunking)).start()
         self._changed()
 
     def reserve_import(self):
@@ -1053,7 +1161,7 @@ class Engine:
                 except OSError:
                     pass
 
-    def _replay(self, parts, columns, jobs, stop):
+    def _replay(self, parts, columns, jobs, stop, chunking):
         """Feed saved recordings through the same chunker the live capture uses."""
         def put(job):
             while not stop.is_set():
@@ -1069,8 +1177,7 @@ class Engine:
                     total += w.getnframes()
             done, tick = 0, 0.0
             for path, offset in parts:
-                chunker = core.Chunker(min_s=self.args.min_chunk, max_s=self.args.max_chunk,
-                                       pause_s=self.args.pause)
+                chunker = core.Chunker(**chunking)
                 with wave.open(path) as w:
                     if w.getframerate() != core.SR or w.getsampwidth() != 2:
                         raise RuntimeError(f"{os.path.basename(path)} is not 16 kHz 16-bit audio.")
@@ -1103,6 +1210,9 @@ class Engine:
 
     def stop(self):
         with self.lock:
+            if self.phase == "finishing" and self.cleaning:
+                self.stop_event.set()   # the file is read, the model is still working: cancel
+                return
             if self.phase != "recording":
                 return
             self.phase = "finishing"
@@ -1169,17 +1279,22 @@ class Engine:
             jobs.put(last)
         jobs.put(None)
 
-    def _work(self, jobs, speakers, stop, sid):
+    def _work(self, jobs, speakers, stop, sid, cleanup=None):
         ok, dead = 0, False
+        plan = cleanup["languages"] if cleanup else None
         while True:
             job = jobs.get()
             if job is None:
                 break
-            if dead:
-                continue
+            if dead or (cleanup is not None and stop.is_set()):
+                continue                # a cancelled clean-up changes nothing: skip the rest
             start_s, audio = job
             seconds = len(audio) / core.SR
             language = self.language
+            if plan:                   # clean-up: the language this stretch was recorded in
+                times, spoken = plan
+                language = spoken[max(bisect.bisect_right(times, start_s + 1.5) - 1, 0)]
+                self._use_language(language)
             try:
                 segments = self.transcribe(audio[:, 0])
             except core.Rejected as exc:
@@ -1198,18 +1313,52 @@ class Engine:
                 if getattr(self.transcribe, "context", None):   # don't feed misspellings back in
                     self.transcribe.context = fix(self.transcribe.context, language)
                 for offset, who, text in core.speaker_turns(segments, audio, speakers):
-                    entry, names = self.store.append(sid, round(start_s + offset, 1), who, text, language)
+                    t = round(start_s + offset, 1)
+                    if cleanup is not None:     # held back: applied in one go if the pass completes
+                        cleanup["entries"].append({"t": t, "speaker": who, "text": text,
+                                                   "language": language})
+                        continue
+                    entry, names = self.store.append(sid, t, who, text, language)
                     self.hub.send(type="entry", session=sid, entry=entry, names=names)
-        if not self.store.discard_if_empty(sid):
-            self.store.align(sid)       # a title given while recording now reaches the file name
+        follow_up = None
+        if cleanup is not None:
+            self._use_language(self.language)
+            self._finish_cleanup(sid, cleanup["entries"], stop, dead)
+        elif not self.store.discard_if_empty(sid):
+            final = self.store.align(sid)   # a title given while recording now reaches the file name
+            if self.auto_cleanup and not self.replaying and not dead:
+                follow_up = final
         elif not dead:                  # say why the transcript that was on screen is gone
             what = "the saved recording" if self.replaying else "the recording"
             why = " ".join(self.source_errors)      # a source that failed is the likely reason
             self.hub.send(type="notice", text=f"No speech was recognised in {what}, "
                                               "so no transcript was kept." + (" " + why if why else ""))
         with self.lock:
-            self.phase, self.session, self.replaying = "idle", None, False
+            self.phase, self.session, self.replaying, self.cleaning = "idle", None, False, False
         self._changed()
+        if follow_up:                   # "clean up after recording" is switched on
+            try:
+                self.cleanup(follow_up)
+            except Exception as exc:    # e.g. the audio was not saved
+                core.log(f"No clean-up after the recording: {exc}")
+
+    def _finish_cleanup(self, sid, entries, stop, dead):
+        if dead:
+            return                      # the reason was reported when it happened
+        if stop.is_set():
+            text = "Clean-up stopped. The transcript is unchanged."
+        elif not entries:
+            text = "Clean-up found no speech in the recording. The transcript is unchanged."
+        else:
+            try:
+                before, after = self.store.replace_entries(sid, entries)
+                self.store.align(sid)
+            except Exception as exc:
+                text = f"The cleaned-up transcript could not be saved: {core.describe(exc)}"
+            else:
+                text = (f"Transcript cleaned up: {before} lines became {after}. "
+                        "The version before is in the trash folder.")
+        self.hub.send(type="notice", text=text)
 
 
 # ---------------------------------------------------------------- summary ---
@@ -1388,6 +1537,9 @@ class App:
             return {}
         elif len(parts) == 3 and parts[2] == "summary" and method == "DELETE":
             result = store.set_summary(parts[1], None)
+        elif len(parts) == 3 and parts[2] == "cleanup" and method == "POST":
+            engine.cleanup(parts[1])
+            return {}
         elif len(parts) == 3 and parts[2] == "replay" and method == "POST":
             return {"session": engine.replay(parts[1])["id"]}
         elif len(parts) == 3 and parts[2] == "apply-dictionary" and method == "POST":

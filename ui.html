@@ -122,6 +122,8 @@
     <input type="checkbox" id="mic-speakers"> Several people on my mic</label>
   <label title="Keep the recording as a WAV file next to the transcript (about 230 MB per hour with microphone and system audio). Applies from the next recording.">
     <input type="checkbox" id="save-audio"> Save audio</label>
+  <label title="When a recording stops, transcribe it once more in long pieces and replace the live lines with the result: better punctuation, fewer sentences cut in two. Needs Save audio.">
+    <input type="checkbox" id="auto-cleanup"> Clean up after recording</label>
   <label>Language <select id="language"></select></label>
   <button id="dictionary">Dictionary</button>
 </header>
@@ -140,6 +142,7 @@
     <input id="title" aria-label="Transcript title" placeholder="Name this transcript">
     <button id="rename" title="Rename this transcript; the files are renamed to match">Rename</button>
     <button id="summarise" title="Write a summary with decisions and action items. Sends the transcript text to the Anthropic API.">Summarise</button>
+    <button id="cleanup" hidden title="Transcribe the saved recording again in long pieces and replace these lines with the result: better punctuation, fewer sentences cut in two. Speaker names are kept.">Clean up</button>
     <button id="replay" hidden title="Transcribe the saved recording again into a new transcript, with the language, dictionary and speaker settings selected now. This one stays as it is.">Re-transcribe</button>
     <span id="file"></span>
   </div>
@@ -329,8 +332,10 @@ function renderBar() {
   const { phase, error, model, language } = state.status;
   const record = $('#record');
   record.className = phase === 'recording' ? 'on' : '';
-  record.disabled = !(phase === 'idle' || phase === 'recording');
-  record.textContent = { loading: 'Loading model…', idle: '● Record', starting: 'Starting…', importing: 'Importing…',
+  const cancellable = phase === 'finishing' && state.status.cleaning;     // a clean-up can be called off to the end
+  record.disabled = !(phase === 'idle' || phase === 'recording' || cancellable);
+  record.textContent = cancellable ? '■ Stop' :
+                       { loading: 'Loading model…', idle: '● Record', starting: 'Starting…', importing: 'Importing…',
                          recording: '■ Stop', finishing: 'Finishing…', error: 'Unavailable' }[phase];
   if (phase !== 'importing' && !uploading) banner = '';
   const status = $('#status');
@@ -342,6 +347,7 @@ function renderBar() {
 
   $('#mic-speakers').checked = state.status.mic_speakers;
   $('#save-audio').checked = state.status.save_audio;
+  $('#auto-cleanup').checked = state.status.auto_cleanup;
 
   const select = $('#language');
   if (document.activeElement !== select) {
@@ -364,15 +370,17 @@ function renderLive() {
   live.className = here && phase === 'recording' ? 'on' : '';
   if (!here) { live.textContent = ''; return; }
   const queued = progress && progress.queued ? ` · ${progress.queued} chunk(s) waiting for the model` : '';
-  if (phase === 'finishing') live.textContent = 'Transcribing the last audio…';
+  if (phase === 'finishing' && state.status.cleaning) live.textContent = 'Cleaning up: finishing the last pieces…';
+  else if (phase === 'finishing') live.textContent = 'Transcribing the last audio…';
   else if (state.status.replaying)
-    live.textContent = 'Transcribing the saved recording… ' + (progress && progress.replay != null ? Math.round(progress.replay * 100) + '% read' : '');
+    live.textContent = (state.status.cleaning ? 'Cleaning up: the lines below are replaced when it finishes… '
+                                              : 'Transcribing the saved recording… ') + (progress && progress.replay != null ? Math.round(progress.replay * 100) + '% read' : '');
   else if (progress && progress.buffered > 0) live.textContent = `Hearing speech — ${Math.round(progress.buffered)} s so far` + queued;
   else live.textContent = 'Listening…' + queued;
 }
 
 $('#record').onclick = async () => {
-  if (state.status.phase === 'recording') return act('POST', 'record/stop');
+  if (state.status.phase !== 'idle') return act('POST', 'record/stop');   // recording, or a clean-up finishing
   $('#record').disabled = true;
   $('#record').textContent = 'Starting…';
   try {
@@ -387,6 +395,11 @@ $('#record').onclick = async () => {
 $('#language').onchange = event => {
   event.target.blur();
   act('POST', 'language', { language: event.target.value });
+};
+
+$('#auto-cleanup').onchange = async event => {
+  await act('POST', 'settings', { auto_cleanup: event.target.checked });
+  if (event.target.checked && !state.status.save_audio) toast('Clean-up works from the saved recording: switch Save audio on as well.');
 };
 
 $('#save-audio').onchange = async event => {
@@ -635,9 +648,18 @@ $('#replay').onclick = async () => {
   toast('Re-transcribing into a new transcript. The original is unchanged.');
 };
 
+$('#cleanup').onclick = async () => {
+  if (!confirm('Replace the lines of this transcript with a cleaner transcription of its recording?\n\n' +
+               'Speaker names are kept. Text you edited by hand is not. A copy of the current version goes to the trash folder.')) return;
+  progress = null;
+  await act('POST', `sessions/${session.id}/cleanup`);
+};
+
 function renderPlayer() {
   $('#replay').hidden = !playable();
   $('#replay').disabled = state.status.phase !== 'idle';
+  $('#cleanup').hidden = !playable();
+  $('#cleanup').disabled = state.status.phase !== 'idle';
   player.hidden = !playable();
   if (!playable()) {
     if (loaded) { player.pause(); player.removeAttribute('src'); player.load(); }

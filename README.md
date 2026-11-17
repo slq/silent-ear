@@ -20,6 +20,9 @@ anywhere unless you ask for a summary or choose a hosted transcription backend
   given to the model as a hint, and listed mishearings are always replaced.
 - **Language switching** during a recording.
 - **Audio kept and playable.** Click a line's time to play from there.
+- **Clean up** a transcript from its recording: a second pass in long pieces replaces the
+  live lines, with better punctuation and fewer sentences cut in two. On demand, or
+  automatically when a recording stops.
 - **Re-transcribe** a saved recording with different settings, into a new transcript.
 - **Import** audio and video files (mp3, m4a, wav, mp4, mkv, webm, ...).
 - **Summaries** with decisions and action items, written by Claude (optional, needs an
