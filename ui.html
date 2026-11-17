@@ -76,6 +76,8 @@
   main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   #head { display: flex; gap: 8px; padding: 12px 20px 4px; align-items: center; }
   #head button { white-space: nowrap; flex: none; }
+  #head { flex-wrap: wrap; }
+  #export { flex: none; width: 96px; }
   #title { flex: 1; min-width: 80px; font-size: 18px; font-weight: 600; border-color: transparent; background: none; }
   #title:hover, #title:focus { border-color: var(--line); background: var(--panel); }
   #file { color: var(--muted); font-size: 12px; max-width: 45%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -166,6 +168,12 @@
   <div id="head">
     <input id="title" aria-label="Transcript title" placeholder="Name this transcript">
     <button id="rename" title="Rename this transcript; the files are renamed to match">Rename</button>
+    <select id="export" title="Save this transcript as a file" aria-label="Export this transcript">
+      <option value="">Export…</option>
+      <option value="md">Markdown (.md)</option>
+      <option value="docx">Word (.docx)</option>
+      <option value="srt">Subtitles (.srt)</option>
+    </select>
     <button id="summarise" title="Write a summary with decisions and action items. Sends the transcript text to the Anthropic API.">Summarise</button>
     <button id="cleanup" hidden title="Transcribe the saved recording again in long pieces and replace these lines with the result: better punctuation, fewer sentences cut in two. Speaker names are kept.">Clean up</button>
     <button id="replay" hidden title="Transcribe the saved recording again into a new transcript, with the language, dictionary and speaker settings selected now. This one stays as it is.">Re-transcribe</button>
@@ -839,6 +847,26 @@ $('#title').onchange = async event => {
 };
 $('#title').onkeydown = event => { if (event.key === 'Enter') event.target.blur(); };
 $('#rename').onclick = () => { $('#title').focus(); $('#title').select(); };
+
+$('#export').onchange = async event => {
+  const kind = event.target.value;
+  event.target.value = '';
+  if (!kind || !session) return;
+  const url = `/api/sessions/${session.id}/export/${kind}`;
+  // Ask first, so a refusal (subtitles need timings) shows as a message, not a broken download.
+  const response = await fetch(url);
+  if (!response.ok) {
+    const problem = await response.json().catch(() => ({}));
+    return toast(problem.error || 'The export failed.');
+  }
+  const link = el('a');
+  link.href = URL.createObjectURL(await response.blob());
+  link.download = (/filename="([^"]+)"/.exec(response.headers.get('Content-Disposition') || '') || [])[1] || `${session.id}.${kind}`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+};
 
 // -------------------------------------------------------------- player ---
 

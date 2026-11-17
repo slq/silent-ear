@@ -30,6 +30,7 @@ anywhere unless you ask for a summary or choose a hosted transcription backend
 - **Import** audio and video files (mp3, m4a, wav, mp4, mkv, webm, ...).
 - **Summaries** with decisions and action items, written by Claude (optional, needs an
   API key).
+- **Export** to Markdown, Word (.docx) or subtitles (.srt).
 - **Plain files.** Each session is a `.txt`, a self-describing `.json` and a `.wav`.
 
 ## Requirements

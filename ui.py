@@ -22,20 +22,24 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import io
 import json
 import os
 import queue
 import re
 import shutil
 import sys
+import textwrap
 import threading
 import time
 import unicodedata
 import wave
 import webbrowser
+import zipfile
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
+from xml.sax.saxutils import escape as xml_escape
 
 import numpy as np
 
@@ -60,7 +64,8 @@ PROMPT_TERMS_CHARS = 500   # Whisper keeps ~220 prompt tokens; leave room for th
 ABOUT = (
     "Transcript of a recorded conversation, produced by automatic speech recognition. "
     "'entries' are in the order they were spoken. In each entry 'speaker' is who said it, "
-    "'time' is the wall-clock time, 't' the seconds since 'started', and 'language' the "
+    "'time' is the wall-clock time, 't' the seconds since 'started' ('t_end' is where the "
+    "line ended, when that was measured), and 'language' the "
     "language the recogniser was set to (null if it was detecting it). "
     "'speakers' lists everyone who talks. Where named_by_user is false the name is an automatic "
     "voice label: one person may appear under two labels and two people may share one; "
@@ -346,8 +351,9 @@ def new_session(sid, started, title=None, model=None, sources=None, source_file=
             "names": {}, "entries": [], "next": 1}
 
 
-def add_entry(session, t, speaker, text, language=None):
-    entry = {"id": session["next"], "t": t, "speaker": speaker, "language": language, "text": text}
+def add_entry(session, t, speaker, text, language=None, end=None):
+    entry = {"id": session["next"], "t": t, "end": end, "speaker": speaker, "language": language,
+             "text": text}
     session["next"] += 1
     session["entries"].append(entry)
     if speaker:
@@ -426,6 +432,194 @@ def summary_prompt(session, dictionary=None):
     return "\n".join(head) + "\n\nTranscript:\n" + "\n".join(lines)
 
 
+# ---------------------------------------------------------------- exports ---
+
+def _facts(session):
+    """The line under the title: when, how long, who."""
+    started = datetime.fromisoformat(session["started"])
+    times = [e["t"] for e in session["entries"] if e["t"] is not None]
+    names = list(dict.fromkeys(n for n in (display_name(session, e) for e in session["entries"]) if n))
+    parts = [f"{started:%A} {started.day} {started:%B %Y}, {started:%H:%M}"]
+    if times:
+        minutes = max(1, round(max(times) / 60))
+        parts.append(f"about {minutes} minute{'' if minutes == 1 else 's'}")
+    if names:
+        parts.append("Speakers: " + ", ".join(names))
+    return " · ".join(parts)
+
+
+def _turns(session):
+    """The transcript as (speaker, clock time, [paragraphs]) per change of speaker."""
+    started = datetime.fromisoformat(session["started"])
+    turns = []
+    for e in session["entries"]:
+        name = display_name(session, e)
+        if turns and (name is None or name == turns[-1][0]):
+            turns[-1][2].append(e["text"])
+        else:
+            clock = "" if e["t"] is None else f"{started + timedelta(seconds=e['t']):%H:%M:%S}"
+            turns.append((name, clock, [e["text"]]))
+    return turns
+
+
+def _markdown_blocks(text):
+    """A summary's Markdown as (kind, level, text): heading, bullet or paragraph."""
+    for raw in text.split("\n"):
+        line = raw.rstrip()
+        heading = re.match(r"(#{1,4})\s+(.*)", line)
+        bullet = re.match(r"(\s*)(?:[-*•]|\d+[.)])\s+(.*)", line)
+        if heading:
+            yield "heading", len(heading.group(1)), heading.group(2)
+        elif bullet:
+            yield "bullet", 1 if len(bullet.group(1)) >= 2 else 0, bullet.group(2)
+        elif line.strip():
+            yield "paragraph", 0, line.strip()
+
+
+def export_markdown(session):
+    out = [f"# {session['title']}", "", _facts(session), ""]
+    if session.get("summary"):
+        for kind, level, text in _markdown_blocks(session["summary"]["text"]):
+            if kind == "heading":       # never level 1: the document has its own title
+                out += ["", "#" * max(level, 2) + " " + text, ""]
+            elif kind == "bullet":
+                out.append("  " * level + "- " + text)
+            else:
+                out += [text, ""]
+        out.append("")
+    out += ["## Transcript", ""]
+    for name, clock, paragraphs in _turns(session):
+        label = " · ".join(part for part in (f"**{name}**" if name else "", clock) if part)
+        if label:
+            out += [label, ""]
+        for paragraph in paragraphs:
+            out += [paragraph, ""]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip() + "\n"
+
+
+def _srt_time(seconds):
+    ms = max(0, round(seconds * 1000))
+    return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
+
+
+def export_srt(session, width=42):
+    """Subtitles. A line of the transcript is long for a screen, so each is cut
+    into cues of at most two rows, sharing the line's time by length."""
+    timed = sorted((e for e in session["entries"] if e["t"] is not None), key=lambda e: e["t"])
+    if not timed:
+        raise Busy("This transcript has no timings, so it cannot be exported as subtitles.")
+    cues, last = [], None
+    for index, e in enumerate(timed):
+        start = e["t"]
+        following = next((x["t"] for x in timed[index + 1:] if x["t"] > start), None)
+        end = e.get("end") or start + len(e["text"]) / 14 + 1.0     # an estimate where none was measured
+        if following is not None:
+            end = min(end, following)
+        end = max(end, start + 0.5)
+        name = display_name(session, e)
+        text = e["text"] if name is None or name == last else f"{name}: {e['text']}"
+        last = name if name is not None else last
+        rows = textwrap.wrap(text, width) or [text]
+        pieces = ["\n".join(rows[i:i + 2]) for i in range(0, len(rows), 2)]     # two rows a cue
+        total, at = sum(len(p) for p in pieces) or 1, start
+        for piece in pieces:
+            until = at + (end - start) * len(piece) / total
+            cues.append((at, until, piece))
+            at = until
+    blocks = [f"{n}\n{_srt_time(a)} --> {_srt_time(b)}\n{text}" for n, (a, b, text) in enumerate(cues, 1)]
+    return "\n\n".join(blocks) + "\n"
+
+
+_DOCX_STYLES = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/>
+<w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:rPrDefault>
+<w:pPrDefault><w:pPr><w:spacing w:after="120" w:line="264" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>
+<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style>
+<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>
+<w:pPr><w:spacing w:after="80"/></w:pPr><w:rPr><w:b/><w:sz w:val="40"/><w:szCs w:val="40"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>
+<w:pPr><w:keepNext/><w:spacing w:before="320" w:after="120"/><w:outlineLvl w:val="0"/></w:pPr><w:rPr><w:b/><w:sz w:val="30"/><w:szCs w:val="30"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>
+<w:pPr><w:keepNext/><w:spacing w:before="220" w:after="80"/><w:outlineLvl w:val="1"/></w:pPr><w:rPr><w:b/><w:sz w:val="25"/><w:szCs w:val="25"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Speaker"><w:name w:val="Speaker"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/>
+<w:pPr><w:keepNext/><w:spacing w:before="200" w:after="40"/></w:pPr></w:style>
+</w:styles>"""
+
+
+def export_docx(session):
+    """A Word document, written directly: a .docx is a zip of a few XML files,
+    and a transcript needs only headings, paragraphs and bold."""
+    def run(text, bold=False, grey=False):
+        text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)     # not allowed in XML
+        props = ("<w:b/>" if bold else "") + ('<w:color w:val="767676"/>' if grey else "")
+        return (f"<w:r>{'<w:rPr>' + props + '</w:rPr>' if props else ''}"
+                f'<w:t xml:space="preserve">{xml_escape(text)}</w:t></w:r>')
+
+    def rich(text):                     # **bold** inside a summary line
+        return "".join(run(part[2:-2], bold=True) if len(part) > 4 and part.startswith("**") and part.endswith("**")
+                       else run(part) for part in re.split(r"(\*\*[^*]+\*\*)", text) if part)
+
+    def paragraph(runs, style=None, indent=None):
+        props = (f'<w:pStyle w:val="{style}"/>' if style else "")
+        if indent is not None:
+            props += f'<w:ind w:left="{360 + 360 * indent}" w:hanging="260"/>'
+        return f"<w:p>{'<w:pPr>' + props + '</w:pPr>' if props else ''}{runs}</w:p>"
+
+    body = [paragraph(run(session["title"]), "Title"), paragraph(run(_facts(session), grey=True))]
+    if session.get("summary"):
+        for kind, level, text in _markdown_blocks(session["summary"]["text"]):
+            if kind == "heading":
+                body.append(paragraph(rich(text), "Heading1" if level <= 2 else "Heading2"))
+            elif kind == "bullet":
+                body.append(paragraph(run("•  ") + rich(text), indent=level))
+            else:
+                body.append(paragraph(rich(text)))
+    body.append(paragraph(run("Transcript"), "Heading1"))
+    for name, clock, paragraphs in _turns(session):
+        if name or clock:
+            body.append(paragraph((run(name, bold=True) if name else "")
+                                  + (run(("   " if name else "") + clock, grey=True) if clock else ""), "Speaker"))
+        body += [paragraph(run(text)) for text in paragraphs]
+    document = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+                + "".join(body) +
+                '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
+                '<w:pgMar w:top="1417" w:right="1417" w:bottom="1417" w:left="1417" w:header="708" w:footer="708" w:gutter="0"/>'
+                "</w:sectPr></w:body></w:document>")
+    package = "http://schemas.openxmlformats.org/package/2006"
+    office = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    main = "application/vnd.openxmlformats-officedocument.wordprocessingml"
+    files = {
+        "[Content_Types].xml":
+            f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="{package}/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            f'<Override PartName="/word/document.xml" ContentType="{main}.document.main+xml"/>'
+            f'<Override PartName="/word/styles.xml" ContentType="{main}.styles+xml"/></Types>',
+        "_rels/.rels":
+            f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="{package}/relationships">'
+            f'<Relationship Id="rId1" Type="{office}/officeDocument" Target="word/document.xml"/></Relationships>',
+        "word/_rels/document.xml.rels":
+            f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="{package}/relationships">'
+            f'<Relationship Id="rId1" Type="{office}/styles" Target="styles.xml"/></Relationships>',
+        "word/styles.xml": _DOCX_STYLES,
+        "word/document.xml": document,
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+    return buffer.getvalue()
+
+
+EXPORTS = {     # format -> (file extension, media type, function returning str or bytes)
+    "md": (".md", "text/markdown; charset=utf-8", export_markdown),
+    "docx": (".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", export_docx),
+    "srt": (".srt", "application/x-subrip; charset=utf-8", export_srt),
+}
+
+
 def to_file(session, dictionary=None):
     """The .json as written to disk: the session plus everything a reader who
     has only this file needs (resolved names, clock times, who is who)."""
@@ -433,7 +627,7 @@ def to_file(session, dictionary=None):
     entries, speakers = [], []
     for e in session["entries"]:
         clock = None if e["t"] is None else f"{started + timedelta(seconds=e['t']):%H:%M:%S}"
-        entries.append({"id": e["id"], "time": clock, "t": e["t"],
+        entries.append({"id": e["id"], "time": clock, "t": e["t"], "t_end": e.get("end"),
                         "speaker": display_name(session, e), "speaker_id": e["speaker"],
                         "language": e.get("language"), "text": e["text"]})
     for key, name in session["names"].items():
@@ -488,7 +682,8 @@ def from_file(data):
             session["audio"].append({"file": name, "offset": item.get("offset") or 0,
                                      "channels": item.get("channels")})
     for e in data.get("entries", []):
-        session["entries"].append({"id": e["id"], "t": e.get("t"), "speaker": e.get("speaker_id"),
+        session["entries"].append({"id": e["id"], "t": e.get("t"), "end": e.get("t_end"),
+                                   "speaker": e.get("speaker_id"),
                                    "language": e.get("language"), "text": e["text"]})
         if e.get("speaker_id"):
             session["names"].setdefault(e["speaker_id"], e.get("speaker") or e["speaker_id"])
@@ -745,7 +940,7 @@ class Store:
             session["entries"] = []
             for entry in fresh:
                 add_entry(session, entry["t"], mapping.get(entry["speaker"]), entry["text"],
-                          entry.get("language"))
+                          entry.get("language"), entry.get("end"))
             session["cleaned"] = datetime.now().isoformat(timespec="seconds")
             self.save(session)
             return before, len(fresh)
@@ -774,10 +969,10 @@ class Store:
             raise KeyError(path)
         return path
 
-    def append(self, sid, t, speaker, text, language=None):
+    def append(self, sid, t, speaker, text, language=None, end=None):
         with self.lock:
             session = self.load(sid)
-            entry = add_entry(session, t, speaker, text, language)
+            entry = add_entry(session, t, speaker, text, language, end)
             self.save(session)
             return entry, session["names"]
 
@@ -901,7 +1096,8 @@ class Store:
                     if name and number > 1 and GENERIC_RE.fullmatch(name):
                         name = f"{name} (part {number})"
                     t = None if entry["t"] is None else entry["t"] + shift
-                    add_entry(merged, t, name, entry["text"], entry.get("language"))
+                    end = None if entry.get("end") is None else entry["end"] + shift
+                    add_entry(merged, t, name, entry["text"], entry.get("language"), end)
                 for item in part["audio"]:      # the recordings move into the joined session
                     source = os.path.join(self.dir, item["file"])
                     n = len(merged["audio"]) + 1
@@ -1507,13 +1703,13 @@ class Engine:
                 segments = [(a, b, fix(text, language)) for a, b, text in segments]
                 if getattr(self.transcribe, "context", None):   # don't feed misspellings back in
                     self.transcribe.context = fix(self.transcribe.context, language)
-                for offset, who, text in core.speaker_turns(segments, audio, speakers):
-                    t = round(start_s + offset, 1)
+                for offset, who, text, until in core.speaker_turns(segments, audio, speakers, with_end=True):
+                    t, end = round(start_s + offset, 1), round(start_s + until, 1)
                     if cleanup is not None:     # held back: applied in one go if the pass completes
-                        cleanup["entries"].append({"t": t, "speaker": who, "text": text,
+                        cleanup["entries"].append({"t": t, "end": end, "speaker": who, "text": text,
                                                    "language": language})
                         continue
-                    entry, names = self.store.append(sid, t, who, text, language)
+                    entry, names = self.store.append(sid, t, who, text, language, end)
                     self.hub.send(type="entry", session=sid, entry=entry, names=names)
         follow_up = None
         if cleanup is not None:
@@ -1855,6 +2051,26 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
+    def _export(self, sid, kind):
+        """Send a transcript as a file to save: Markdown, Word or subtitles."""
+        if kind not in EXPORTS:
+            return self._json({"error": "Unknown export format."}, 404)
+        extension, media_type, make = EXPORTS[kind]
+        try:
+            content = make(self.server.app.store.load(sid))
+        except KeyError:
+            return self._json({"error": "Not found."}, 404)
+        except Busy as exc:
+            return self._json({"error": str(exc)}, 409)
+        body = content if isinstance(content, bytes) else content.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", media_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition", f'attachment; filename="{sid}{extension}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _import(self):
         """Receive an audio or video file as the raw request body and hand it to the engine."""
         app = self.server.app
@@ -1901,6 +2117,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._audio(parts[2], int(parts[4]))
         if self.command == "POST" and parts == ["api", "import"]:
             return self._import()
+        if (self.command == "GET" and len(parts) == 5 and parts[:2] == ["api", "sessions"]
+                and parts[3] == "export"):
+            return self._export(parts[2], parts[4])
         try:
             body = {}
             if self.command == "GET":       # a GET's parameters arrive in the query string

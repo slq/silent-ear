@@ -534,9 +534,9 @@ class Output:
             self.file.close()
 
 
-def speaker_turns(segments, audio, speakers):
+def speaker_turns(segments, audio, speakers, with_end=False):
     """Label each segment and merge neighbours with the same speaker:
-    [(start_s, speaker or None, text), ...]."""
+    [(start_s, speaker or None, text), ...], with end_s as a fourth item on request."""
     turns = []
     for start, end, text in segments:
         who = None
@@ -546,10 +546,10 @@ def speaker_turns(segments, audio, speakers):
             except Exception as exc:
                 log(f"[speaker detection failed: {exc}]")
         if turns and turns[-1][1] == who:
-            turns[-1] = (turns[-1][0], who, turns[-1][2] + " " + text)
+            turns[-1] = (turns[-1][0], who, turns[-1][2] + " " + text, end)
         else:
-            turns.append((start, who, text))
-    return turns
+            turns.append((start, who, text, end))
+    return turns if with_end else [turn[:3] for turn in turns]
 
 
 def transcribe_worker(jobs, transcribe, output, state, stop, speakers=None):
