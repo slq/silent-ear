@@ -35,7 +35,7 @@ import wave
 import webbrowser
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import numpy as np
 
@@ -209,6 +209,32 @@ def wav_peak(path):
             if not raw:
                 return peak
             peak = max(peak, int(np.abs(np.frombuffer(raw, "<i2").astype(np.int32)).max()))
+
+
+def fold(text):
+    """Text as searched: lower case, accents dropped ("żółć" matches "zolc")."""
+    text = unicodedata.normalize("NFKD", text.replace("ł", "l").replace("Ł", "L"))
+    return "".join(ch for ch in text if not unicodedata.combining(ch)).casefold()
+
+
+def snippet(text, terms, before=50, after=110):
+    """The part of a text around the first search term, cut at word boundaries."""
+    folded, origin = [], []             # folding can change lengths: keep where each piece came from
+    for index, ch in enumerate(text):
+        piece = fold(ch)
+        folded.append(piece)
+        origin.extend([index] * len(piece))
+    folded = "".join(folded)
+    found = [at for at in (folded.find(term) for term in terms) if at >= 0]
+    at = origin[min(found)] if found else 0
+    start, end = max(0, at - before), min(len(text), at + after)
+    if start > 0:
+        space = text.find(" ", start, at)
+        start = space + 1 if space >= 0 else start
+    if end < len(text):
+        space = text.rfind(" ", at, end)
+        end = space if space > at else end
+    return ("…" if start > 0 else "") + text[start:end].strip() + ("…" if end < len(text) else "")
 
 
 def slug(title):
@@ -538,6 +564,49 @@ class Store:
                         "count": len(s["entries"]), "speakers": sorted(names)})
         out.sort(key=lambda s: s["started"], reverse=True)
         return out
+
+    def search(self, query, limit=300, per_session=30):
+        """Find lines, summaries and titles containing every word of the query.
+
+        Case and accents are ignored. A speaker's name counts as part of their
+        lines, so "marcin budget" finds what Marcin said about the budget.
+        """
+        terms = [term for term in fold(query).split() if term]
+        result = {"query": query, "terms": terms, "total": 0, "truncated": False, "sessions": []}
+        if not terms or max(len(term) for term in terms) < 2:
+            return result
+        for summary in self.summaries():                # newest first
+            try:
+                session = self.load(summary["id"])
+            except (KeyError, OSError, ValueError):
+                continue
+            started = datetime.fromisoformat(session["started"])
+            hits, count = [], 0
+            saved = session.get("summary")
+            if saved and all(term in fold(saved["text"]) for term in terms):
+                count += 1
+                hits.append({"kind": "summary", "entry": None, "time": None, "speaker": "Summary",
+                             "snippet": snippet(" ".join(re.sub(r"[#*]+", " ", saved["text"]).split()), terms)})
+            for entry in session["entries"]:
+                name = display_name(session, entry)
+                haystack = fold((name or "") + " " + entry["text"])
+                if not all(term in haystack for term in terms):
+                    continue
+                count += 1
+                if len(hits) < per_session:
+                    clock = None if entry["t"] is None else f"{started + timedelta(seconds=entry['t']):%H:%M:%S}"
+                    hits.append({"kind": "line", "entry": entry["id"], "time": clock, "speaker": name,
+                                 "snippet": snippet(entry["text"], terms)})
+            in_title = all(term in fold(session["title"]) for term in terms)
+            if count or in_title:
+                result["sessions"].append({"id": session["id"], "title": session["title"],
+                                           "started": session["started"], "title_match": in_title,
+                                           "count": count, "hits": hits})
+                result["total"] += count
+                if result["total"] >= limit:
+                    result["truncated"] = True
+                    break
+        return result
 
     def _unique(self, sid):
         candidate, n = sid, 1
@@ -1497,6 +1566,8 @@ class App:
         store, engine = self.store, self.engine
         if parts == ["state"] and method == "GET":
             return self.state()
+        if parts == ["search"] and method == "GET":
+            return store.search(str(body.get("q", ""))[:200])
         if parts == ["record", "start"] and method == "POST":
             return {"session": engine.start()["id"]}
         if parts == ["record", "stop"] and method == "POST":
@@ -1701,6 +1772,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._import()
         try:
             body = {}
+            if self.command == "GET":       # a GET's parameters arrive in the query string
+                body = {key: values[0] for key, values in parse_qs(urlparse(self.path).query).items()}
             length = int(self.headers.get("Content-Length") or 0)
             if length:
                 body = json.loads(self.rfile.read(length).decode("utf-8"))

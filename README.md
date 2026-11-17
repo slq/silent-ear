@@ -18,6 +18,7 @@ anywhere unless you ask for a summary or choose a hosted transcription backend
   remove whole transcripts. Removed transcripts go to a trash folder.
 - **Dictionary** of preferred spellings per language (company names, jargon). Terms are
   given to the model as a hint, and listed mishearings are always replaced.
+- **Search** across all transcripts, summaries and titles, ignoring case and accents.
 - **Language switching** during a recording.
 - **Audio kept and playable.** Click a line's time to play from there.
 - **Clean up** a transcript from its recording: a second pass in long pieces replaces the

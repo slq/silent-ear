@@ -45,6 +45,15 @@
   #sessions .del { visibility: hidden; padding: 0 6px; border: 0; background: none; color: var(--muted); }
   #sessions li:hover .del { visibility: visible; }
   aside footer { padding: 8px; border-top: 1px solid var(--line); }
+  #search { margin: 8px 8px 2px; }
+  #sessions li.group { cursor: pointer; font-weight: 600; padding-bottom: 2px; }
+  #sessions li.group .meta { font-weight: 400; }
+  #sessions li.hit { display: block; padding: 4px 8px 4px 20px; font-size: 13px; }
+  #sessions li.hit .meta { display: block; }
+  #sessions li.hit .words { overflow-wrap: anywhere; }
+  mark { background: hsl(48 95% 60% / .55); color: inherit; border-radius: 2px; padding: 0 1px; }
+  .row.found { animation: found 2.4s ease-out; }
+  @keyframes found { from { background: hsl(48 95% 60% / .6); } to { background: transparent; } }
   aside footer button { width: 100%; }
   aside footer { display: grid; gap: 6px; }
   body.dropping::after { content: "Drop audio or video files to transcribe them"; position: fixed; inset: 12px;
@@ -129,6 +138,8 @@
 </header>
 
 <aside>
+  <input id="search" type="search" placeholder="Search all transcripts…" aria-label="Search all transcripts"
+         title="Finds lines, summaries and titles containing every word. Case and accents are ignored; a speaker's name counts as part of their lines.">
   <ul id="sessions"></ul>
   <footer>
     <button id="import" title="Transcribe audio or video files (mp3, m4a, wav, mp4, mkv, webm, …). You can also drop files anywhere on this page.">Import audio or video…</button>
@@ -253,6 +264,7 @@ async function refresh() {
     session = openId ? await api('GET', 'sessions/' + openId, undefined, true).catch(() => null) : null;
   }
   if (!editing) render();
+  if (found) runSearch();             // the transcripts may have changed under the results
   pumpImports();
 }
 
@@ -414,9 +426,91 @@ $('#mic-speakers').onchange = async event => {
 
 // ------------------------------------------------------------ sessions ---
 
+// -------------------------------------------------------------- search ---
+
+let found = null;         // the last search result while the box has text in it
+let searchTimer;
+
+const foldChar = ch => ch.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().replace('ł', 'l');
+
+// Text with the search terms marked. Folding is done per character, as on the
+// server, so a match found without accents lands on the accented original.
+function marked(parent, text, terms) {
+  let folded = '';
+  const origin = [];
+  [...text].forEach((ch, index) => {
+    const piece = foldChar(ch);
+    folded += piece;
+    for (let i = 0; i < piece.length; i++) origin.push(index);
+  });
+  const chars = [...text], hit = new Array(chars.length).fill(false);
+  for (const term of terms) {
+    for (let at = folded.indexOf(term); at >= 0; at = folded.indexOf(term, at + 1))
+      for (let i = at; i < at + term.length; i++) hit[origin[i]] = true;
+  }
+  for (let i = 0; i < chars.length;) {
+    let j = i;
+    while (j < chars.length && hit[j] === hit[i]) j++;
+    const piece = chars.slice(i, j).join('');
+    parent.append(hit[i] ? el('mark', '', piece) : piece);
+    i = j;
+  }
+}
+
+async function runSearch() {
+  const query = $('#search').value.trim();
+  if (query.length < 2) { found = null; if (state) renderSessions(); return; }
+  const result = await api('GET', 'search?q=' + encodeURIComponent(query), undefined, true).catch(() => null);
+  if (result && $('#search').value.trim() === query) { found = result; renderSessions(); }
+}
+
+$('#search').oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(runSearch, 200); };
+$('#search').onkeydown = event => {
+  if (event.key === 'Escape') { event.target.value = ''; runSearch(); }
+};
+
+async function openHit(id, hit) {
+  openId = id;
+  if (hit && hit.kind === 'summary') shownSummaries.add(id);
+  await refresh();
+  if (!hit || hit.kind !== 'line') return;
+  const row = document.querySelector(`.row[data-id="${hit.entry}"]`);
+  if (!row) return;
+  row.scrollIntoView({ block: 'center' });
+  row.classList.remove('found');
+  void row.offsetWidth;               // restart the highlight if it is already running
+  row.classList.add('found');
+}
+
+function renderFound(list) {
+  if (!found.sessions.length) list.append(el('li', 'empty', `Nothing found for “${found.query}”.`));
+  for (const s of found.sessions) {
+    const group = el('li', 'group' + (s.id === openId ? ' open' : ''));
+    const info = el('div', 'info');
+    const title = el('div', 'title');
+    marked(title, s.title, s.title_match ? found.terms : []);
+    info.append(title, el('div', 'meta', s.count ? `${s.count} match${s.count === 1 ? '' : 'es'}` : 'title matches'));
+    group.append(info);
+    group.onclick = () => openHit(s.id, s.hits[0]);
+    list.append(group);
+    for (const hit of s.hits) {
+      const item = el('li', 'hit');
+      item.append(el('span', 'meta', [hit.time, hit.speaker].filter(Boolean).join(' · ')));
+      const words = el('span', 'words');
+      marked(words, hit.snippet, found.terms);
+      item.append(words);
+      item.onclick = () => openHit(s.id, hit);
+      list.append(item);
+    }
+    if (s.count > s.hits.length) list.append(el('li', 'hit meta', `… and ${s.count - s.hits.length} more in this transcript`));
+  }
+  if (found.truncated) list.append(el('li', 'empty', 'Many matches: only the newest are shown. Add a word to narrow it down.'));
+}
+
 function renderSessions() {
   const list = $('#sessions');
   list.replaceChildren();
+  if (found) { renderFound(list); renderJoin(); return; }
   if (!state.sessions.length) list.append(el('li', 'empty', 'No transcripts yet. Press Record.'));
   for (const s of state.sessions) {
     const item = el('li', s.id === openId ? 'open' : '');
@@ -502,6 +596,7 @@ function appendEntry(entry) {
   }
 
   const row = el('div', 'row');
+  row.dataset.id = entry.id;
   const text = el('span', 'text', entry.text);
   const acts = el('span', 'acts');
   const base = `sessions/${session.id}/entries/${entry.id}`;
