@@ -45,6 +45,18 @@
   #sessions .del { visibility: hidden; padding: 0 6px; border: 0; background: none; color: var(--muted); }
   #sessions li:hover .del { visibility: visible; }
   aside footer { padding: 8px; border-top: 1px solid var(--line); }
+  #meters { display: flex; gap: 10px; align-items: center; font-size: 12px; color: var(--muted); }
+  #meters span { display: flex; gap: 5px; align-items: center; }
+  .meter { width: 54px; height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
+  .meter i { display: block; height: 100%; width: 0; background: hsl(140 55% 45%); transition: width .12s linear; }
+  .meter.hot i { background: hsl(25 85% 52%); }
+  .meter.dead { outline: 1px solid var(--danger); }
+  .meter.big { width: 100%; height: 12px; border-radius: 6px; margin-top: 8px; }
+  .device { margin: 14px 0; }
+  .device label { display: block; font-weight: 600; margin-bottom: 4px; }
+  .device select { width: 100%; }
+  .hint { color: var(--muted); font-size: 13px; min-height: 20px; margin-top: 4px; }
+  .hint.bad { color: var(--danger); }
   #search { margin: 8px 8px 2px; }
   #sessions li.group { cursor: pointer; font-weight: 600; padding-bottom: 2px; }
   #sessions li.group .meta { font-weight: 400; }
@@ -133,6 +145,8 @@
     <input type="checkbox" id="save-audio"> Save audio</label>
   <label title="When a recording stops, transcribe it once more in long pieces and replace the live lines with the result: better punctuation, fewer sentences cut in two. Needs Save audio.">
     <input type="checkbox" id="auto-cleanup"> Clean up after recording</label>
+  <span id="meters" title="Input level of each audio source"></span>
+  <button id="devices" title="Choose the microphone and the output to record, and check their levels">Devices</button>
   <label>Language <select id="language"></select></label>
   <button id="dictionary">Dictionary</button>
 </header>
@@ -173,6 +187,29 @@
   <div id="log"></div>
   <div id="live"></div>
 </main>
+
+<dialog id="device-dialog">
+  <h2>Devices</h2>
+  <p>What a recording captures. The meters show what each device delivers right now:
+     speak, or play something, and the bar should move.</p>
+  <div class="device">
+    <label for="mic-select">Microphone</label>
+    <select id="mic-select"></select>
+    <div class="meter big" id="mic-meter"><i></i></div>
+    <div class="hint" id="mic-hint"></div>
+  </div>
+  <div class="device">
+    <label for="speaker-select">System audio (what you hear)</label>
+    <select id="speaker-select"></select>
+    <div class="meter big" id="speaker-meter"><i></i></div>
+    <div class="hint" id="speaker-hint"></div>
+  </div>
+  <div class="bar">
+    <span class="hint" id="device-note"></span>
+    <span class="spacer"></span>
+    <button id="close-devices" class="primary">Done</button>
+  </div>
+</dialog>
 
 <dialog id="dict">
   <h2>Dictionary</h2>
@@ -425,6 +462,99 @@ $('#mic-speakers').onchange = async event => {
 };
 
 // ------------------------------------------------------------ sessions ---
+
+// ------------------------------------------------------------- devices ---
+
+const heard = {};         // per source label: the last reading, and the loudest peak of the last 3 s
+let levelsTimer, monitorTimer;
+
+// Loudness on a decibel scale, 0 to 100: -60 dB (silence) to 0 dB (full scale).
+const percent = rms => Math.max(0, Math.min(100, (20 * Math.log10(Math.max(rms, 1e-6)) + 60) / 60 * 100));
+
+function paintMeter(node, reading) {
+  node.classList.toggle('hot', Boolean(reading) && reading.peak > 0.89);
+  node.classList.toggle('dead', Boolean(reading) && Boolean(reading.error));
+  node.firstElementChild.style.width = (reading && !reading.error ? percent(reading.rms) : 0) + '%';
+}
+
+function hintFor(label, selected) {
+  const state = heard[label];
+  if (selected === 'off') return ['Not recorded.', false];
+  if (!state) return ['Waiting for the device…', false];
+  if (state.reading.error) return ['Cannot record from this device: ' + state.reading.error, true];
+  const recent = Math.max(...state.peaks.map(p => p.peak), 0);
+  if (state.peaks.length > 6 && recent === 0)
+    return [label === 'Mic' ? 'No signal at all. The microphone may be muted, or blocked in the Windows privacy settings.'
+                            : 'Silent. Nothing is playing on this output right now.', label === 'Mic'];
+  if (state.peaks.length > 6 && recent < 0.01)
+    return [label === 'Mic' ? 'Very quiet. Speak, and if the bar barely moves, raise the input level in the sound settings.'
+                            : 'Very quiet.', false];
+  return [state.reading.device, false];
+}
+
+function renderDeviceHints() {
+  if (!$('#device-dialog').open) return;
+  for (const [label, prefix] of [['Mic', 'mic'], ['System', 'speaker']]) {
+    const [text, bad] = hintFor(label, $(`#${prefix}-select`).value);
+    $(`#${prefix}-hint`).textContent = text;
+    $(`#${prefix}-hint`).className = 'hint' + (bad ? ' bad' : '');
+    paintMeter($(`#${prefix}-meter`), heard[label] && heard[label].reading);
+  }
+}
+
+function showLevels(sources) {
+  const now = Date.now(), bar = $('#meters');
+  for (const label of Object.keys(heard)) if (!sources.some(s => s.label === label)) delete heard[label];
+  for (const reading of sources) {
+    const state = heard[reading.label] || (heard[reading.label] = { peaks: [] });
+    state.reading = reading;
+    state.peaks = [...state.peaks.filter(p => now - p.at < 3000), { at: now, peak: reading.peak }];
+  }
+  bar.replaceChildren(...sources.map(reading => {
+    const item = el('span', '', reading.label === 'Mic' ? 'Mic' : 'System');
+    const meter = el('div', 'meter');
+    meter.append(el('i'));
+    paintMeter(meter, reading);
+    item.title = reading.error ? `${reading.device}: ${reading.error}` : reading.device;
+    item.append(meter);
+    return item;
+  }));
+  renderDeviceHints();
+  clearTimeout(levelsTimer);            // readings stop arriving when nothing is listening
+  if (sources.length) levelsTimer = setTimeout(() => showLevels([]), 2500);
+}
+
+function fillDevices(select, names, fallback, chosen, noun) {
+  const options = [['', `System default${fallback ? ' (' + fallback + ')' : ''}`], ...names.map(n => [n, n]), ['off', `Off: do not record ${noun}`]];
+  if (chosen && chosen !== 'off' && !names.includes(chosen)) options.splice(1, 0, [chosen, chosen + ' (not connected)']);
+  select.replaceChildren(...options.map(([value, text]) => { const o = el('option', '', text); o.value = value; return o; }));
+  select.value = chosen;
+}
+
+async function openDevices() {
+  const devices = await api('GET', 'devices');
+  fillDevices($('#mic-select'), devices.mics, devices.default_mic, devices.mic, 'the microphone');
+  fillDevices($('#speaker-select'), devices.speakers, devices.default_speaker, devices.speaker, 'system audio');
+  const busy = state.status.phase !== 'idle' && state.status.phase !== 'loading';
+  $('#mic-select').disabled = $('#speaker-select').disabled = busy;
+  $('#speaker-select').disabled = busy || !devices.system_audio;
+  $('#device-note').textContent = busy ? 'In use: the choice can be changed when the recording has stopped.'
+    : devices.system_audio ? '' : 'System audio cannot be captured directly on this system.';
+  $('#device-dialog').showModal();
+  renderDeviceHints();
+  const ask = () => api('POST', 'monitor', { on: true }, true).catch(() => {});
+  ask();
+  monitorTimer = setInterval(ask, 4000);      // the meters run for as long as the dialog asks
+}
+
+$('#devices').onclick = openDevices;
+$('#close-devices').onclick = () => $('#device-dialog').close();
+$('#device-dialog').onclose = () => {
+  clearInterval(monitorTimer);
+  api('POST', 'monitor', { on: false }, true).catch(() => {});
+};
+$('#mic-select').onchange = event => api('POST', 'settings', { mic: event.target.value });
+$('#speaker-select').onchange = event => api('POST', 'settings', { speaker: event.target.value });
 
 // -------------------------------------------------------------- search ---
 
@@ -1006,6 +1136,8 @@ events.onmessage = event => {
       appendEntry(message.entry);
     }
     if (!(state && state.status.replaying)) progress = null;
+  } else if (message.type === 'levels') {
+    showLevels(message.sources);
   } else if (message.type === 'progress' && message.convert != null) {
     showBanner(`Converting ${message.name}… ${Math.round(message.convert * 100)}%`);
   } else if (message.type === 'progress') {

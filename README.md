@@ -19,6 +19,8 @@ anywhere unless you ask for a summary or choose a hosted transcription backend
 - **Dictionary** of preferred spellings per language (company names, jargon). Terms are
   given to the model as a hint, and listed mishearings are always replaced.
 - **Search** across all transcripts, summaries and titles, ignoring case and accents.
+- **Device picker with level meters.** Choose the microphone and the output to record,
+  and see at a glance whether each one delivers sound.
 - **Language switching** during a recording.
 - **Audio kept and playable.** Click a line's time to play from there.
 - **Clean up** a transcript from its recording: a second pass in long pieces replaces the
@@ -137,8 +139,8 @@ The folder is ignored by git.
 ## Troubleshooting
 
 - **"No speech was recognised"**: the message names a device if one failed to open.
-  Otherwise check that the right microphone is the system default (or pass `--mic`) and
-  that its input level is not near zero.
+  Otherwise open **Devices**, pick the right microphone, and watch its meter while you
+  speak: a bar that stays empty means the device delivers no sound.
 - **The GPU is not used**: install the two `nvidia-*` packages above. The top bar shows
   where the model runs ("on cuda" or "on cpu").
 - **Summaries fail with "No Anthropic API key was found"**: the variable must be set in

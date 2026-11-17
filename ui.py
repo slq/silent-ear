@@ -146,6 +146,15 @@ def read_json(path, default):
         return default
 
 
+def level_of(label, device, samples, error=None):
+    """One meter reading: how loud a stretch of samples from a device was."""
+    samples = np.asarray(samples, np.float32)
+    return {"label": label, "device": device,
+            "rms": float(np.sqrt(np.mean(np.square(samples, dtype=np.float64)))) if len(samples) else 0.0,
+            "peak": float(np.abs(samples).max()) if len(samples) else 0.0,
+            "error": core.describe(error) if error else None}
+
+
 def com_init():
     if sys.platform == "win32":     # soundcard talks to WASAPI through COM
         import ctypes
@@ -954,6 +963,13 @@ class Engine:
         self.mic_speakers = bool(args.mic_speakers or saved.get("mic_speakers"))
         self.save_audio = bool(saved.get("save_audio", True))
         self.auto_cleanup = bool(saved.get("auto_cleanup", False))
+        # Which devices to record: "" is the system default, "off" none, otherwise a device name.
+        # A device named on the command line wins over the one chosen in the UI last time.
+        self.mic = "off" if args.no_mic else args.mic or str(saved.get("mic") or "")
+        self.speaker = "off" if args.no_system else args.speaker or str(saved.get("speaker") or "")
+        self._monitor_thread = None
+        self._monitor_stop = threading.Event()
+        self._monitor_until = 0.0
         self.cleaning = False           # the running pass rewrites an existing transcript
         self.transcribe = None
         self.model = ""
@@ -1041,10 +1057,104 @@ class Engine:
             self.save_audio = bool(body["save_audio"])
         if "auto_cleanup" in body:
             self.auto_cleanup = bool(body["auto_cleanup"])
+        devices_changed = False
+        for key in ("mic", "speaker"):
+            if key in body:
+                value = str(body[key] or "")[:300]
+                devices_changed = devices_changed or value != getattr(self, key)
+                setattr(self, key, value)
         write_json(self.settings_path, {"mic_speakers": self.mic_speakers,
                                         "save_audio": self.save_audio,
-                                        "auto_cleanup": self.auto_cleanup})
+                                        "auto_cleanup": self.auto_cleanup,
+                                        "mic": self.mic, "speaker": self.speaker})
+        if devices_changed and self._monitoring():      # the meters follow the new choice
+            self._stop_monitor()
+            self.monitor(True)
         self._changed()
+
+    # ---- devices and level meters ----
+
+    def _source_args(self):
+        """The device choice in the form transcribe.py's open_sources takes."""
+        return argparse.Namespace(
+            no_mic=self.mic == "off", mic=None if self.mic in ("", "off") else self.mic,
+            no_system=self.speaker == "off", speaker=None if self.speaker in ("", "off") else self.speaker)
+
+    def _missing(self, sources):
+        """A line for each device that was asked for and could not be opened."""
+        labels = [s.label for s in sources]
+        problems = []
+        if self.mic != "off" and "Mic" not in labels:
+            problems.append(("Mic", self.mic or "system default",
+                             "the microphone was not found or could not be opened"))
+        if self.speaker != "off" and "System" not in labels and sys.platform != "darwin":
+            problems.append(("System", self.speaker or "system default",
+                             "the output device was not found or cannot be captured"))
+        return problems
+
+    def devices(self):
+        """What can be recorded right now, and what is selected."""
+        com_init()
+        def default(getter):
+            try:
+                return getter().name
+            except Exception:
+                return None
+        return {"mics": [m.name for m in self.sc.all_microphones()],
+                "default_mic": default(self.sc.default_microphone),
+                "speakers": [s.name for s in self.sc.all_speakers()],
+                "default_speaker": default(self.sc.default_speaker),
+                "mic": self.mic, "speaker": self.speaker,
+                "system_audio": sys.platform != "darwin"}
+
+    def _monitoring(self):
+        return self._monitor_thread is not None and self._monitor_thread.is_alive()
+
+    def monitor(self, on=True):
+        """Feed the level meters while nothing is being recorded. The page asks
+        again every few seconds while its devices dialog is open; when it stops
+        asking, the devices are released."""
+        if not on:
+            self._monitor_until = 0.0
+            return
+        self._monitor_until = time.monotonic() + 8.0
+        with self.lock:
+            if self._monitoring() or self.phase not in ("idle", "loading"):
+                return
+            self._monitor_stop = threading.Event()
+            self._monitor_thread = threading.Thread(target=self._monitor, daemon=True,
+                                                    args=(self._monitor_stop,))
+            self._monitor_thread.start()
+
+    def _stop_monitor(self):
+        if self._monitoring():
+            self._monitor_stop.set()
+            self._monitor_thread.join(4)
+
+    def _monitor(self, stop):
+        com_init()
+        try:
+            sources = core.open_sources(self.sc, self._source_args())
+        except Exception as exc:
+            self.hub.send(type="levels", sources=[], error=core.describe(exc))
+            return
+        missing = [{"label": label, "device": device, "error": problem}
+                   for label, device, problem in self._missing(sources)]
+        for source in sources:
+            source.start(stop)
+        while not stop.is_set() and time.monotonic() < self._monitor_until:
+            time.sleep(0.2)
+            levels = []
+            for source in sources:
+                n = source.available()
+                samples = source.take(n) if n else np.zeros(0, np.float32)
+                levels.append(level_of(source.label, source.device.name, samples, source.error))
+            self.hub.send(type="levels", sources=levels + missing)
+        stop.set()
+        for source in sources:
+            if source.thread is not None:
+                source.thread.join(2)
+        self.hub.send(type="levels", sources=[])        # the meters go dark
 
     def start(self):
         with self.lock:
@@ -1055,10 +1165,13 @@ class Engine:
             self.phase = "starting"
         try:
             com_init()
-            sources = core.open_sources(self.sc, self.args)
+            self._stop_monitor()            # the meters hand the devices over
+            sources = core.open_sources(self.sc, self._source_args())
             if not sources:
-                raise RuntimeError("No audio source available.")
+                raise RuntimeError("No audio source available. Check the Devices dialog.")
             labels = [s.label for s in sources]
+            missing = [f"{'The microphone' if label == 'Mic' else 'System audio'} ({device}) is not "
+                       f"being recorded: {problem}." for label, device, problem in self._missing(sources)]
             speakers = None
             if not self.args.no_speakers:
                 try:
@@ -1083,7 +1196,10 @@ class Engine:
         if hasattr(self.transcribe, "context"):
             self.transcribe.context = ""
         stop, jobs = threading.Event(), queue.Queue()
-        self.source_errors = []
+        self.source_errors = list(missing)
+        for problem in missing:
+            core.log(problem)
+            self.hub.send(type="notice", text=problem)
         chunker = core.Chunker(min_s=self.args.min_chunk, max_s=self.args.max_chunk,
                                pause_s=self.args.pause)
         self.stop_event, self.session, self.phase = stop, session["id"], "recording"
@@ -1293,9 +1409,13 @@ class Engine:
             self.worker.join(timeout)
 
     def _capture(self, sources, chunker, jobs, stop, recording=None):
+        heard = [np.zeros(0, np.float32) for _ in sources]     # per source, since the last meter reading
+
         def feed(mix):
             if mix is None:
                 return
+            for i in range(len(sources)):
+                heard[i] = np.concatenate([heard[i], mix[:, 1 + i]])
             if recording is not None:
                 try:
                     recording.writeframes(core.to_pcm16(mix[:, 1:]))
@@ -1311,7 +1431,7 @@ class Engine:
         for source in sources:
             core.log(f"{source.label + ':':<8}{source.device.name}")
             source.start(stop)
-        tick = 0.0
+        tick = meter = 0.0
         while not stop.is_set():
             time.sleep(0.1)
             for source in sources:
@@ -1327,10 +1447,16 @@ class Engine:
                 stop.set()
                 break
             feed(core.pull_mix(sources))
+            if time.monotonic() - meter >= 0.25:
+                meter = time.monotonic()
+                self.hub.send(type="levels", sources=[
+                    level_of(s.label, s.device.name, heard[i], s.error) for i, s in enumerate(sources)])
+                heard = [np.zeros(0, np.float32) for _ in sources]
             if time.monotonic() - tick >= 1.0:
                 tick = time.monotonic()
                 buffered = len(chunker.frames) / core.FPS if chunker.started else 0.0
                 self.hub.send(type="progress", buffered=buffered, queued=jobs.qsize())
+        self.hub.send(type="levels", sources=[])        # the meters go dark
         with self.lock:
             self.phase = "finishing"
         self._changed()
@@ -1578,6 +1704,11 @@ class App:
             return {}
         if parts == ["settings"] and method == "POST":
             engine.set_settings(body)
+            return {}
+        if parts == ["devices"] and method == "GET":
+            return engine.devices()
+        if parts == ["monitor"] and method == "POST":
+            engine.monitor(bool(body.get("on", True)))
             return {}
         if parts == ["dictionary"] and method == "PUT":
             self.dictionary.set(body.get("dictionary", {}))
