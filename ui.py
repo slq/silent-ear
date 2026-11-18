@@ -349,6 +349,9 @@ def new_session(sid, started, title=None, model=None, sources=None, source_file=
             "started": started.isoformat(timespec="seconds"),
             "model": model, "sources": sources, "source_file": source_file, "audio": [],
             "summary": None, "cleaned": None,
+            # Voice labels the user merged into another speaker: while a recording runs, the
+            # detector keeps handing out the old label, and new lines must follow the merge.
+            "aliases": {},
             "names": {}, "entries": [], "next": 1}
 
 
@@ -655,6 +658,7 @@ def to_file(session, dictionary=None):
         "glossary": dictionary.glossary(languages) if dictionary else [],
         "summary": session.get("summary"),
         "cleaned_up": session.get("cleaned"),
+        "merged_voice_labels": session.get("aliases") or {},
         "speakers": speakers,
         "entries": entries,
         "next": session["next"],
@@ -677,6 +681,8 @@ def from_file(data):
     if isinstance(data.get("summary"), dict) and data["summary"].get("text"):
         session["summary"] = data["summary"]
     session["cleaned"] = data.get("cleaned_up")
+    if isinstance(data.get("merged_voice_labels"), dict):
+        session["aliases"] = {str(k): str(v) for k, v in data["merged_voice_labels"].items()}
     for item in data.get("audio") or []:
         name = item.get("file") if isinstance(item, dict) else None
         if isinstance(name, str) and name == os.path.basename(name) and name.endswith(".wav"):
@@ -943,13 +949,39 @@ class Store:
                 add_entry(session, entry["t"], mapping.get(entry["speaker"]), entry["text"],
                           entry.get("language"), entry.get("end"))
             session["cleaned"] = datetime.now().isoformat(timespec="seconds")
+            session["aliases"] = {}     # the labels were dealt out anew: old merges are folded in above
             self.save(session)
             return before, len(fresh)
+
+    @staticmethod
+    def _merge_speakers(session, source, target):
+        """Make every line of one speaker the other's, now and for lines still to come."""
+        for entry in session["entries"]:
+            if entry["speaker"] == source:
+                entry["speaker"] = target
+        aliases = session.setdefault("aliases", {})
+        for label, points_to in aliases.items():
+            if points_to == source:
+                aliases[label] = target
+        aliases[source] = target
+        aliases.pop(target, None)
+        session["names"].pop(source, None)
+
+    def merge_speakers(self, sid, source, target):
+        """Fold one speaker into another: for a voice the detection split in two."""
+        with self.lock:
+            session = self.load(sid)
+            if source == target or source not in session["names"] or target not in session["names"]:
+                raise ValueError("Pick two different speakers of this transcript.")
+            self._merge_speakers(session, source, target)
+            self.save(session)
+            return session
 
     def name_if_automatic(self, sid, key, name):
         """Name a speaker who still carries an automatic label; True if it was done."""
         with self.lock:
             session = self.load(sid)
+            key = session.get("aliases", {}).get(key, key)
             if session["names"].get(key) != key or not AUTO_RE.fullmatch(key):
                 return False
             session["names"][key] = name
@@ -983,6 +1015,7 @@ class Store:
     def append(self, sid, t, speaker, text, language=None, end=None):
         with self.lock:
             session = self.load(sid)
+            speaker = session.get("aliases", {}).get(speaker, speaker)      # merged into someone else
             entry = add_entry(session, t, speaker, text, language, end)
             self.save(session)
             return entry, session["names"]
@@ -995,8 +1028,15 @@ class Store:
             if retitled:
                 session["title"] = title
             for key, name in (names or {}).items():
-                if key in session["names"] and str(name).strip():
-                    session["names"][key] = str(name).strip()
+                name = str(name).strip()
+                if key not in session["names"] or not name:
+                    continue
+                same = next((k for k, shown in session["names"].items()
+                             if k != key and shown.casefold() == name.casefold()), None)
+                if same is not None:    # renamed to someone who is already here: one person, so merge
+                    self._merge_speakers(session, key, same)
+                else:
+                    session["names"][key] = name
             if retitled and rename_files:
                 self._align(session)
             else:
@@ -2147,6 +2187,11 @@ class App:
             return {}
         elif len(parts) == 3 and parts[2] == "summary" and method == "DELETE":
             result = store.set_summary(parts[1], None)
+        elif len(parts) == 4 and parts[2:] == ["speakers", "merge"] and method == "POST":
+            target = str(body.get("into", ""))
+            result = store.merge_speakers(parts[1], str(body.get("from", "")), target)
+            if not AUTO_RE.fullmatch(result["names"][target]):      # more speech for a named voice
+                engine.enroll(result["id"], target, result["names"][target])
         elif len(parts) == 3 and parts[2] == "cleanup" and method == "POST":
             engine.cleanup(parts[1])
             return {}

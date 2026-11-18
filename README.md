@@ -134,7 +134,8 @@ The folder is ignored by git.
 ## Limits
 
 - Speaker detection is a guess by voice. One person can be split in two and two similar
-  voices can be merged; renaming both labels to the same name fixes a split.
+  voices can be merged. A split is fixed with "Same person as…" next to the speaker's
+  name, or by renaming one of the two to the other's name.
 - Speaker numbers restart with every recording. "Speaker 1" in two recordings need not
   be the same person, unless you named them: named voices are recognised again.
 - Overlapping speech is attributed to one speaker, the remote one when both sides talk.

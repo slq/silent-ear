@@ -110,6 +110,8 @@
   .who { border: 0; background: none; padding: 0 4px; margin-left: 60px; font-weight: 700;
          color: hsl(var(--h) 60% var(--name-l)); }
   .who:hover { text-decoration: underline; }
+  .merge { visibility: hidden; font-size: 12px; padding: 0 4px; margin-left: 8px; max-width: 150px; color: var(--muted); }
+  .turn:hover .merge, .merge:focus { visibility: visible; }
   .rename { margin-left: 60px; font-weight: 700; width: 220px; }
   .row { display: flex; gap: 8px; padding: 2px 4px; border-radius: 4px; align-items: baseline;
          border-left: 3px solid hsl(var(--h) 55% 55% / .55); }
@@ -799,6 +801,8 @@ function appendEntry(entry) {
       who.title = 'Rename this speaker everywhere in the transcript';
       who.onclick = () => renameSpeaker(who, entry.speaker);
       lastTurn.append(who);
+      const others = Object.entries(session.names).filter(([key]) => key !== entry.speaker);
+      if (others.length) lastTurn.append(mergePicker(entry.speaker, name, others));
       lastName = name;
     }
     log.append(lastTurn);
@@ -830,6 +834,24 @@ function appendEntry(entry) {
   row.append(time, text, acts);
   lastTurn.append(row);
   if (pinned) log.scrollTop = log.scrollHeight;
+}
+
+// "Same person as…": folds a speaker into another one, for a voice the detection split in two.
+function mergePicker(key, name, others) {
+  const select = el('select', 'merge');
+  select.title = `All lines of ${name} become another speaker's. For one person who was detected as two.`;
+  const add = (value, label) => { const o = el('option', '', label); o.value = value; select.append(o); };
+  add('', 'Same person as…');
+  for (const [other, shown] of others) add(other, shown);
+  select.onchange = async () => {
+    const into = select.value;
+    select.value = '';
+    if (!into) return;
+    if (!confirm(`Merge ${name} into ${session.names[into]}?\n\nAll lines of ${name} become ${session.names[into]}'s, ` +
+                 'including lines still to come in a running recording. This cannot be undone.')) return;
+    await act('POST', `sessions/${session.id}/speakers/merge`, { from: key, into });
+  };
+  return select;
 }
 
 function speakerPicker(entry, base) {
