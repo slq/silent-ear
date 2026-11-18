@@ -52,6 +52,11 @@
   .meter.hot i { background: hsl(25 85% 52%); }
   .meter.dead { outline: 1px solid var(--danger); }
   .meter.big { width: 100%; height: 12px; border-radius: 6px; margin-top: 8px; }
+  #voice-list { list-style: none; margin: 14px 0 0; padding: 0; }
+  #voice-list li { display: flex; gap: 10px; align-items: baseline; padding: 6px 0; border-top: 1px solid var(--line); }
+  #voice-list .name { font-weight: 600; flex: 1; overflow-wrap: anywhere; }
+  #voice-list .meta { color: var(--muted); font-size: 12px; }
+  #voice-list button { font-size: 12px; padding: 1px 8px; }
   .device { margin: 14px 0; }
   .device label { display: block; font-weight: 600; margin-bottom: 4px; }
   .device select { width: 100%; }
@@ -96,6 +101,8 @@
   #player { margin: 4px 20px; height: 36px; width: calc(100% - 40px); flex: none; }
   #player[hidden] { display: none; }
   .row.playing { background: hsl(var(--h) 60% 55% / .16); }
+  #provisional { margin: 10px 0 0 64px; color: var(--muted); font-style: italic; overflow-wrap: anywhere; }
+  #provisional::after { content: " …"; }
   .row time.play { cursor: pointer; }
   .row time.play:hover { color: var(--accent); text-decoration: underline; }
   #log { flex: 1; overflow-y: auto; padding: 4px 20px 24px; }
@@ -147,7 +154,10 @@
     <input type="checkbox" id="save-audio"> Save audio</label>
   <label title="When a recording stops, transcribe it once more in long pieces and replace the live lines with the result: better punctuation, fewer sentences cut in two. Needs Save audio.">
     <input type="checkbox" id="auto-cleanup"> Clean up after recording</label>
+  <label id="live-preview-label" title="Show grey provisional text while someone is still speaking; it is replaced by the final line when the sentence ends. Uses extra GPU time. Applies from the next recording.">
+    <input type="checkbox" id="live-preview"> Text while speaking</label>
   <span id="meters" title="Input level of each audio source"></span>
+  <button id="voices" title="Voices you have named: they are recognised in later recordings">Voices</button>
   <button id="devices" title="Choose the microphone and the output to record, and check their levels">Devices</button>
   <label>Language <select id="language"></select></label>
   <button id="dictionary">Dictionary</button>
@@ -195,6 +205,16 @@
   <div id="log"></div>
   <div id="live"></div>
 </main>
+
+<dialog id="voice-dialog">
+  <h2>Voices</h2>
+  <p>When you give a speaker a name, their voice is saved here, and later recordings label it
+     with that name from the start. A voice is saved from the transcript's recording, so
+     “Save audio” must be on. Voice prints stay on this computer, in voices.json.</p>
+  <label><input type="checkbox" id="remember-voices"> Remember voices when I name a speaker, and recognise them</label>
+  <ul id="voice-list"></ul>
+  <div class="bar"><span class="spacer"></span><button id="close-voices" class="primary">Done</button></div>
+</dialog>
 
 <dialog id="device-dialog">
   <h2>Devices</h2>
@@ -405,6 +425,9 @@ function renderBar() {
   $('#mic-speakers').checked = state.status.mic_speakers;
   $('#save-audio').checked = state.status.save_audio;
   $('#auto-cleanup').checked = state.status.auto_cleanup;
+  $('#live-preview').checked = state.status.live_preview && state.status.preview_available;
+  $('#live-preview').disabled = !state.status.preview_available;
+  $('#live-preview-label').style.opacity = state.status.preview_available || phase === 'loading' ? '' : '.5';
 
   const select = $('#language');
   if (document.activeElement !== select) {
@@ -454,6 +477,11 @@ $('#language').onchange = event => {
   act('POST', 'language', { language: event.target.value });
 };
 
+$('#live-preview').onchange = async event => {
+  await act('POST', 'settings', { live_preview: event.target.checked });
+  if (state.status.phase === 'recording') toast('Applies from the next recording.');
+};
+
 $('#auto-cleanup').onchange = async event => {
   await act('POST', 'settings', { auto_cleanup: event.target.checked });
   if (event.target.checked && !state.status.save_audio) toast('Clean-up works from the saved recording: switch Save audio on as well.');
@@ -470,6 +498,32 @@ $('#mic-speakers').onchange = async event => {
 };
 
 // ------------------------------------------------------------ sessions ---
+
+// -------------------------------------------------------------- voices ---
+
+async function renderVoices() {
+  const data = await api('GET', 'voices');
+  $('#remember-voices').checked = data.remember;
+  const list = $('#voice-list');
+  list.replaceChildren();
+  if (!data.voices.length) list.append(el('li', 'meta', 'No voices saved yet. Rename a speaker in a transcript that has a recording.'));
+  for (const voice of data.voices) {
+    const item = el('li');
+    const when = voice.updated ? new Date(voice.updated).toLocaleDateString([], { dateStyle: 'medium' }) : '';
+    const from = `${voice.seconds} s of speech from ${voice.recordings} recording${voice.recordings === 1 ? '' : 's'}`;
+    const remove = button('Forget', `Delete the saved voice of ${voice.name}`, async () => {
+      if (!confirm(`Forget the voice of ${voice.name}?\nTranscripts keep the name; later recordings will no longer recognise the voice.`)) return;
+      await api('DELETE', 'voices/' + encodeURIComponent(voice.name));
+      renderVoices();
+    });
+    item.append(el('span', 'name', voice.name), el('span', 'meta', [from, when].filter(Boolean).join(' · ')), remove);
+    list.append(item);
+  }
+}
+
+$('#voices').onclick = async () => { await renderVoices(); $('#voice-dialog').showModal(); };
+$('#close-voices').onclick = () => $('#voice-dialog').close();
+$('#remember-voices').onchange = event => api('POST', 'settings', { remember_voices: event.target.checked });
 
 // ------------------------------------------------------------- devices ---
 
@@ -711,7 +765,24 @@ function renderTranscript() {
   $('#file').textContent = session.id + '.txt';
   if (!session.entries.length) log.append(el('div', 'empty', 'Nothing transcribed yet.'));
   session.entries.forEach(appendEntry);
+  showProvisional();
   log.scrollTop = log.scrollHeight;
+}
+
+// Speech still being spoken: a grey line under the transcript, replaced by the
+// real line when the sentence ends.
+let provisional = null;   // { session, text }
+
+function showProvisional() {
+  const log = $('#log');
+  const old = $('#provisional');
+  const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+  if (old) old.remove();
+  if (!provisional || !session || provisional.session !== session.id) return;
+  const line = el('div', '', provisional.text);
+  line.id = 'provisional';
+  log.append(line);
+  if (pinned) log.scrollTop = log.scrollHeight;
 }
 
 function appendEntry(entry) {
@@ -1158,11 +1229,16 @@ events.onmessage = event => {
   if (message.type === 'entry') {
     const row = state && state.sessions.find(s => s.id === message.session);
     if (row) row.count += 1;
+    if (provisional && provisional.session === message.session) provisional = null;   // the real line is here
     if (session && message.session === session.id) {
       session.names = message.names;
       session.entries.push(message.entry);
       appendEntry(message.entry);
     }
+    showProvisional();
+  } else if (message.type === 'preview') {
+    provisional = message.text ? { session: message.session, text: message.text } : null;
+    showProvisional();
     if (!(state && state.status.replaying)) progress = null;
   } else if (message.type === 'levels') {
     showLevels(message.sources);

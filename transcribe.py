@@ -357,14 +357,21 @@ class LocalWhisper:
             self.device = "cpu"
         self.context = ""
 
-    def __call__(self, audio, attempts=1):
-        """Return [(start_s, end_s, text), ...] relative to the start of audio."""
+    supports_preview = True     # cheap enough to decode unfinished speech for a provisional text
+
+    def __call__(self, audio, attempts=1, preview=False):
+        """Return [(start_s, end_s, text), ...] relative to the start of audio.
+
+        A preview is a quick look at speech that is still going on: decoded
+        greedily, and left out of the running context, because the same audio
+        comes back for its real decoding once the chunk is complete.
+        """
         initial = " ".join(p for p in (self.prompt, self.context) if p) or None
         segments, _ = self.model.transcribe(
             audio.astype(np.float32),
             language=self.language,
             task="transcribe",
-            beam_size=5,
+            beam_size=1 if preview else 5,
             initial_prompt=initial,
             condition_on_previous_text=False,
             vad_filter=True,                    # second guard against "Thank you." on noise
@@ -376,7 +383,7 @@ class LocalWhisper:
         result = [(s.start, s.end, s.text.strip()) for s in segments
                   if s.no_speech_prob < 0.8 and s.text.strip()]
         text = " ".join(t for _, _, t in result)
-        if text:
+        if text and not preview:
             self.context = (self.context + " " + text)[-self.CONTEXT_CHARS:]
         return result
 
@@ -434,7 +441,10 @@ class Speakers:
     MIN_NEW_S = 1.5     # a voice must speak this long before it can become a new speaker
     MIN_ID_S = 0.8      # shorter than this: too little audio to judge, keep the last speaker
 
-    def __init__(self, labels, threshold=0.6, split_mic=False):
+    KNOWN_MARGIN = 0.05     # a saved voice must match a little better than a voice of this recording:
+                            # a wrong name is worse than an unnamed "Speaker 2"
+
+    def __init__(self, labels, threshold=0.6, split_mic=False, known=None):
         import sherpa_onnx
         config = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
             model=fetch_speaker_model(), num_threads=2)
@@ -446,6 +456,14 @@ class Speakers:
         # Several people sharing the microphone: cluster its voices too ("Mic 1", "Mic 2", ...)
         # instead of calling everything heard there "You".
         self.local = Voices("Mic") if split_mic else None
+        # Voices saved from earlier recordings, as (name, unit vector). When a voice of this
+        # recording turns out to be one of them, `recognised` maps its label to that name.
+        self.known = [(name, np.asarray(vector, np.float32)) for name, vector in (known or [])]
+        self.recognised = {}
+
+    def embed(self, voice):
+        """The voice print of a stretch of speech: a unit vector, close to others of the same voice."""
+        return self._embed(voice)
 
     def label(self, audio, start_s, end_s):
         """Who spoke audio[start_s:end_s] (audio as produced by pull_mix)."""
@@ -495,7 +513,16 @@ class Speakers:
             voices.centroids[best] = c / np.linalg.norm(c)
             voices.counts[best] += 1
         voices.last = best
-        return voices.name(best)
+        label = voices.name(best)
+        settled = voices.counts[best] >= 2 or seconds >= 2 * self.MIN_NEW_S    # not on a first short scrap
+        if self.known and settled and label not in self.recognised:
+            centroid = voices.centroids[best]
+            scores = [float(vector @ centroid) if len(vector) == len(centroid) else -1.0
+                      for _, vector in self.known]
+            top = int(np.argmax(scores))
+            if scores[top] >= self.threshold + self.KNOWN_MARGIN:
+                self.recognised[label] = self.known[top][0]
+        return label
 
 
 class Output:

@@ -58,6 +58,7 @@ LANGUAGES = [
     ("nl", "Dutch"), ("cs", "Czech"), ("sk", "Slovak"), ("uk", "Ukrainian"),
     ("sv", "Swedish"), ("ja", "Japanese"), ("zh", "Chinese"),
 ]
+PREVIEW_EVERY = 2.0     # seconds between provisional decodings of speech still going on
 # The clean-up pass: pieces close to Whisper's 30-second window, still cut at a pause.
 CLEANUP_CHUNKS = {"min_s": 20.0, "max_s": 28.0, "pause_s": 0.5}
 PROMPT_TERMS_CHARS = 500   # Whisper keeps ~220 prompt tokens; leave room for the running context
@@ -945,6 +946,16 @@ class Store:
             self.save(session)
             return before, len(fresh)
 
+    def name_if_automatic(self, sid, key, name):
+        """Name a speaker who still carries an automatic label; True if it was done."""
+        with self.lock:
+            session = self.load(sid)
+            if session["names"].get(key) != key or not AUTO_RE.fullmatch(key):
+                return False
+            session["names"][key] = name
+            self.save(session)
+            return True
+
     def set_summary(self, sid, summary):
         """Store a summary with the session, or remove it (None)."""
         with self.lock:
@@ -1115,6 +1126,98 @@ class Store:
             return merged
 
 
+# ----------------------------------------------------------------- voices ---
+
+class VoiceBook:
+    """Voices the user has put a name to, kept across recordings (voices.json).
+
+    A voice is stored as a "voice print": the unit vector the speaker model
+    gives for that person's speech. It identifies a voice, so it stays on this
+    machine, next to the transcripts.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.profiles = []
+        for item in read_json(path, []) or []:
+            if isinstance(item, dict) and item.get("name") and isinstance(item.get("vector"), list):
+                self.profiles.append(item)
+
+    def known(self):
+        with self.lock:
+            return [(p["name"], p["vector"]) for p in self.profiles]
+
+    def listing(self):
+        with self.lock:
+            return [{"name": p["name"], "seconds": round(p.get("seconds", 0)),
+                     "recordings": p.get("recordings", 1), "updated": p.get("updated")}
+                    for p in sorted(self.profiles, key=lambda p: p["name"].casefold())]
+
+    def add(self, name, vector, seconds):
+        """Save a voice, or refine the one already kept under that name."""
+        vector = np.asarray(vector, np.float64)
+        with self.lock:
+            existing = next((p for p in self.profiles if p["name"].casefold() == name.casefold()), None)
+            if existing and len(existing["vector"]) == len(vector):
+                weight = min(existing.get("seconds", 0), 300)       # an old profile never drowns out new speech
+                vector = np.asarray(existing["vector"], np.float64) * weight + vector * seconds
+                existing["seconds"] = existing.get("seconds", 0) + seconds
+                existing["recordings"] = existing.get("recordings", 1) + 1
+            else:
+                if existing:
+                    self.profiles.remove(existing)
+                existing = {"name": name, "seconds": seconds, "recordings": 1}
+                self.profiles.append(existing)
+            existing["vector"] = [round(float(x), 6) for x in vector / (np.linalg.norm(vector) + 1e-9)]
+            existing["updated"] = datetime.now().isoformat(timespec="seconds")
+            write_json(self.path, self.profiles)
+
+    def remove(self, name):
+        with self.lock:
+            kept = [p for p in self.profiles if p["name"] != name]
+            if len(kept) == len(self.profiles):
+                raise KeyError(name)
+            self.profiles = kept
+            write_json(self.path, self.profiles)
+
+
+def session_voice(folder, session, key, limit_s=90.0):
+    """The speech of one speaker of a session, cut out of its recordings: up to
+    limit_s seconds of mono samples, or None when there is no usable audio."""
+    local = key == "You" or bool(re.fullmatch(r"Mic \d+", key))
+    timed = sorted((e for e in session["entries"] if e["t"] is not None), key=lambda e: e["t"])
+    pieces, total = [], 0.0
+    for index, entry in enumerate(timed):
+        if entry["speaker"] != key or total >= limit_s:
+            continue
+        start = entry["t"]
+        end = entry.get("end") or start + len(entry["text"]) / 14 + 1.0
+        following = next((x["t"] for x in timed[index + 1:] if x["t"] > start), None)
+        if following is not None:
+            end = min(end, following)
+        item = max((a for a in session["audio"] if a["offset"] <= start + 0.01),
+                   key=lambda a: a["offset"], default=None)
+        path = os.path.join(folder, item["file"]) if item else None
+        if not path or not os.path.isfile(path) or end - start < 0.5:
+            continue
+        with wave.open(path) as w:
+            if w.getframerate() != core.SR or w.getsampwidth() != 2:
+                continue
+            w.setpos(min(int((start - item["offset"]) * core.SR), w.getnframes()))
+            raw = w.readframes(int(min(end - start, limit_s - total) * core.SR))
+            block = np.frombuffer(raw, "<i2").reshape(-1, w.getnchannels()).astype(np.float32) / 32767.0
+        channels = item.get("channels") or []
+        if "Mic" in channels and "System" in channels and block.shape[1] == len(channels):
+            # The side of the call the speaker is on carries the clean copy of the voice.
+            voice = block[:, channels.index("Mic" if local else "System")]
+        else:
+            voice = np.clip(block.sum(axis=1), -1.0, 1.0)
+        pieces.append(voice)
+        total += len(voice) / core.SR
+    return np.concatenate(pieces) if pieces else None
+
+
 # ----------------------------------------------------------------- events ---
 
 class Hub:
@@ -1163,6 +1266,16 @@ class Engine:
         # A device named on the command line wins over the one chosen in the UI last time.
         self.mic = "off" if args.no_mic else args.mic or str(saved.get("mic") or "")
         self.speaker = "off" if args.no_system else args.speaker or str(saved.get("speaker") or "")
+        # Voices the user has named: saved when a speaker is renamed, recognised in later recordings.
+        self.voices = VoiceBook(os.path.join(store.dir, "voices.json"))
+        self.remember_voices = bool(saved.get("remember_voices", True))
+        self._embedder = None
+        # Provisional text while someone is still speaking. None = decide from the hardware:
+        # on for a local model on the GPU, off on the CPU, where it would hold up the real work.
+        self.live_preview = saved.get("live_preview")
+        self._preview = None            # (generation, start_s, audio) waiting for the worker
+        self._preview_generation = 0
+        self._preview_lock = threading.Lock()
         self._monitor_thread = None
         self._monitor_stop = threading.Event()
         self._monitor_until = 0.0
@@ -1183,7 +1296,10 @@ class Engine:
                 "language": self.language or "auto", "session": self.session,
                 "replaying": self.replaying, "cleaning": self.cleaning,
                 "mic_speakers": self.mic_speakers, "save_audio": self.save_audio,
-                "auto_cleanup": self.auto_cleanup}
+                "auto_cleanup": self.auto_cleanup,
+                "remember_voices": self.remember_voices,
+                "live_preview": bool(self.live_preview),
+                "preview_available": bool(getattr(self.transcribe, "supports_preview", False))}
 
     def _changed(self):
         self.hub.send(type="changed")
@@ -1214,6 +1330,8 @@ class Engine:
             core.log(f"Model failed to load: {exc}")
         else:
             self.transcribe = transcribe
+            if self.live_preview is None:
+                self.live_preview = getattr(transcribe, "device", "") == "cuda"
             self.transcribe.language = self.language    # may have been changed while loading
             self.refresh_prompt()
             self.phase = "idle"
@@ -1253,6 +1371,10 @@ class Engine:
             self.save_audio = bool(body["save_audio"])
         if "auto_cleanup" in body:
             self.auto_cleanup = bool(body["auto_cleanup"])
+        if "live_preview" in body:
+            self.live_preview = bool(body["live_preview"])
+        if "remember_voices" in body:
+            self.remember_voices = bool(body["remember_voices"])
         devices_changed = False
         for key in ("mic", "speaker"):
             if key in body:
@@ -1262,10 +1384,45 @@ class Engine:
         write_json(self.settings_path, {"mic_speakers": self.mic_speakers,
                                         "save_audio": self.save_audio,
                                         "auto_cleanup": self.auto_cleanup,
+                                        "live_preview": self.live_preview,
+                                        "remember_voices": self.remember_voices,
                                         "mic": self.mic, "speaker": self.speaker})
         if devices_changed and self._monitoring():      # the meters follow the new choice
             self._stop_monitor()
             self.monitor(True)
+        self._changed()
+
+    # ---- remembered voices ----
+
+    def _speakers(self, labels):
+        """Speaker detection for a recording, primed with the voices saved so far."""
+        if self.args.no_speakers:
+            return None
+        try:
+            known = self.voices.known() if self.remember_voices else None
+            return core.Speakers(labels, self.args.speaker_threshold, self.mic_speakers, known)
+        except Exception as exc:
+            core.log(f"Speaker detection off: {exc}")
+            return None
+
+    def enroll(self, sid, key, name):
+        """Save the voice behind a speaker the user has just named (in the background)."""
+        if self.remember_voices and not self.args.no_speakers:
+            threading.Thread(target=self._enroll, daemon=True, args=(sid, key, name)).start()
+
+    def _enroll(self, sid, key, name):
+        try:
+            voice = session_voice(self.store.dir, self.store.load(sid), key)
+            if voice is None or len(voice) < 3 * core.SR:
+                return                  # no recording, or too little speech to tell a voice by
+            if self._embedder is None:
+                self._embedder = core.Speakers(["File"], self.args.speaker_threshold)
+            self.voices.add(name, self._embedder.embed(voice), len(voice) / core.SR)
+        except Exception as exc:
+            core.log(f"The voice of {name} was not saved: {core.describe(exc)}")
+            return
+        self.hub.send(type="notice", text=f"The voice of {name} is saved: later recordings will "
+                                          "name it automatically.")
         self._changed()
 
     # ---- devices and level meters ----
@@ -1368,12 +1525,7 @@ class Engine:
             labels = [s.label for s in sources]
             missing = [f"{'The microphone' if label == 'Mic' else 'System audio'} ({device}) is not "
                        f"being recorded: {problem}." for label, device, problem in self._missing(sources)]
-            speakers = None
-            if not self.args.no_speakers:
-                try:
-                    speakers = core.Speakers(labels, self.args.speaker_threshold, self.mic_speakers)
-                except Exception as exc:
-                    core.log(f"Speaker detection off: {exc}")
+            speakers = self._speakers(labels)
             session = self.store.create(datetime.now().replace(microsecond=0), self.model, labels)
             recording = None
             if self.save_audio:
@@ -1461,12 +1613,7 @@ class Engine:
 
     def _begin_replay(self, session, labels, audio, cleanup=None):
         """Start transcribing a session's saved recordings (phase is "starting" or "importing")."""
-        speakers = None
-        if not self.args.no_speakers:
-            try:
-                speakers = core.Speakers(labels, self.args.speaker_threshold, self.mic_speakers)
-            except Exception as exc:
-                core.log(f"Speaker detection off: {exc}")
+        speakers = self._speakers(labels)
         if hasattr(self.transcribe, "context"):
             self.transcribe.context = ""
         self.source_errors = []
@@ -1627,7 +1774,9 @@ class Engine:
         for source in sources:
             core.log(f"{source.label + ':':<8}{source.device.name}")
             source.start(stop)
-        tick = meter = 0.0
+        tick = meter = previewed = 0.0
+        sid, spoken = self.session, None
+        previews = self.live_preview and getattr(self.transcribe, "supports_preview", False)
         while not stop.is_set():
             time.sleep(0.1)
             for source in sources:
@@ -1643,6 +1792,20 @@ class Engine:
                 stop.set()
                 break
             feed(core.pull_mix(sources))
+            # Provisional text: every couple of seconds, hand the worker the speech buffered
+            # so far. `utterance` names the chunk being built, so a preview of a chunk that
+            # has since been cut is recognised as out of date.
+            utterance = chunker.seen - len(chunker.frames) if chunker.started else None
+            if utterance != spoken:
+                if spoken is not None and previews:
+                    self._drop_preview(sid)
+                spoken = utterance
+            if (previews and utterance is not None and len(chunker.frames) >= 2 * core.FPS
+                    and time.monotonic() - previewed >= PREVIEW_EVERY and jobs.empty()):
+                previewed = time.monotonic()
+                audio = np.concatenate([frame[:, 0] for frame in chunker.frames])
+                with self._preview_lock:
+                    self._preview = (self._preview_generation, utterance / core.FPS, audio)
             if time.monotonic() - meter >= 0.25:
                 meter = time.monotonic()
                 self.hub.send(type="levels", sources=[
@@ -1653,6 +1816,8 @@ class Engine:
                 buffered = len(chunker.frames) / core.FPS if chunker.started else 0.0
                 self.hub.send(type="progress", buffered=buffered, queued=jobs.qsize())
         self.hub.send(type="levels", sources=[])        # the meters go dark
+        if previews:
+            self._drop_preview(sid)
         with self.lock:
             self.phase = "finishing"
         self._changed()
@@ -1672,9 +1837,14 @@ class Engine:
 
     def _work(self, jobs, speakers, stop, sid, cleanup=None):
         ok, dead = 0, False
+        recognised = set()              # labels already given a saved voice's name
         plan = cleanup["languages"] if cleanup else None
         while True:
-            job = jobs.get()
+            try:
+                job = jobs.get(timeout=0.25)
+            except queue.Empty:         # nothing final to do: a moment for unfinished speech
+                self._preview_pass(sid, jobs)
+                continue
             if job is None:
                 break
             if dead or (cleanup is not None and stop.is_set()):
@@ -1711,6 +1881,14 @@ class Engine:
                         continue
                     entry, names = self.store.append(sid, t, who, text, language, end)
                     self.hub.send(type="entry", session=sid, entry=entry, names=names)
+                # A voice of this recording matched one saved earlier: give it that name,
+                # unless the user has already named it themselves.
+                for label, name in list(getattr(speakers, "recognised", {}).items()):
+                    if cleanup is None and label not in recognised:
+                        recognised.add(label)
+                        if self.store.name_if_automatic(sid, label, name):
+                            self.hub.send(type="notice", text=f"Recognised the voice of {name}.")
+                            self._changed()
         follow_up = None
         if cleanup is not None:
             self._use_language(self.language)
@@ -1732,6 +1910,30 @@ class Engine:
                 self.cleanup(follow_up)
             except Exception as exc:    # e.g. the audio was not saved
                 core.log(f"No clean-up after the recording: {exc}")
+
+    def _drop_preview(self, sid):
+        """The chunk being built has ended: its provisional text is out of date."""
+        with self._preview_lock:
+            self._preview_generation += 1
+            self._preview = None
+        self.hub.send(type="preview", session=sid, text="")
+
+    def _preview_pass(self, sid, jobs):
+        """Decode the speech still being spoken, for a provisional line on screen.
+        Best effort: only when no finished chunk is waiting, and thrown away if
+        the chunk it belongs to has been cut in the meantime."""
+        with self._preview_lock:
+            pending, self._preview = self._preview, None
+        if pending is None or not jobs.empty():
+            return
+        generation, start_s, audio = pending
+        try:
+            segments = self.transcribe(audio, preview=True)
+        except Exception:
+            return
+        text = self.dictionary.apply(" ".join(text for _, _, text in segments).strip(), self.language)
+        if text and generation == self._preview_generation:
+            self.hub.send(type="preview", session=sid, text=text, t=round(start_s, 1))
 
     def _finish_cleanup(self, sid, entries, stop, dead):
         if dead:
@@ -1901,6 +2103,12 @@ class App:
         if parts == ["settings"] and method == "POST":
             engine.set_settings(body)
             return {}
+        if parts == ["voices"] and method == "GET":
+            return {"voices": engine.voices.listing(), "remember": engine.remember_voices}
+        if len(parts) == 2 and parts[0] == "voices" and method == "DELETE":
+            engine.voices.remove(unquote(parts[1]))
+            self.hub.send(type="changed")
+            return {}
         if parts == ["devices"] and method == "GET":
             return engine.devices()
         if parts == ["monitor"] and method == "POST":
@@ -1924,8 +2132,12 @@ class App:
             if method == "GET":
                 return store.load(sid)
             if method == "PATCH":       # the file keeps its name while it is being recorded into
+                before = store.load(sid)["names"]
                 result = store.update(sid, body.get("title"), body.get("names"),
                                       rename_files=sid != engine.session)
+                for key, name in result["names"].items():   # a speaker was given a name: keep the voice
+                    if name != before.get(key) and not AUTO_RE.fullmatch(name):
+                        engine.enroll(result["id"], key, name)
             elif method == "DELETE":
                 self._not_recording([sid])
                 store.trash(sid)
