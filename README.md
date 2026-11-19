@@ -152,9 +152,9 @@ The folder is ignored by git.
 ## Troubleshooting
 
 - **"No speech was recognised"**: the message names a device if one failed to open.
-  Otherwise open **Devices**, pick the right microphone, and watch its meter while you
+  Otherwise open the arrow beside **Record**, choose **Devices**, pick the right microphone, and watch its meter while you
   speak: a bar that stays empty means the device delivers no sound.
-- **The GPU is not used**: install the two `nvidia-*` packages above. The top bar shows
+- **The GPU is not used**: install the two `nvidia-*` packages above. The bottom status bar shows
   where the model runs ("on cuda" or "on cpu").
 - **Summaries fail with "No Anthropic API key was found"**: the variable must be set in
   the terminal that starts `ui.py`.
