@@ -103,6 +103,8 @@
   .row.playing { background: hsl(var(--h) 60% 55% / .16); }
   #provisional { margin: 10px 0 0 64px; color: var(--muted); font-style: italic; overflow-wrap: anywhere; }
   #provisional::after { content: " …"; }
+  .row.seekable .text { cursor: pointer; }
+  .row.seekable .text[contenteditable] { cursor: text; }
   .row time.play { cursor: pointer; }
   .row time.play:hover { color: var(--accent); text-decoration: underline; }
   #log { flex: 1; overflow-y: auto; padding: 4px 20px 24px; }
@@ -828,7 +830,16 @@ function appendEntry(entry) {
     if (playable()) {
       time.className = 'play';
       time.title = 'Play the recording from here';
-      time.onclick = () => playFrom(entry.t);
+      time.onclick = event => { event.stopPropagation(); playFrom(entry.t); };
+      // A click on the line moves the player to it without starting it: press play to
+      // hear exactly this line. If it is already playing, it carries on from here.
+      row.classList.add('seekable');
+      text.title = 'Click to move the player to this line';
+      row.onclick = event => {
+        if (event.target.closest('.acts') || text.isContentEditable) return;
+        if (String(getSelection()).trim()) return;      // the click ended a text selection
+        playFrom(entry.t, !player.paused);
+      };
     }
   }
   row.append(time, text, acts);
@@ -978,7 +989,7 @@ function playable() {     // not while it is still being recorded into
 
 function loadTrack(index, at, play) {
   const url = `/api/sessions/${session.id}/audio/${index}`;
-  const start = () => { player.currentTime = at; if (play) player.play(); };
+  const start = () => { player.currentTime = at; showPlaying(); if (play) player.play(); };
   track = index;
   if (loaded === url && player.readyState > 0) return start();
   loaded = url;
@@ -1009,17 +1020,23 @@ function renderPlayer() {
   player.hidden = !playable();
   if (!playable()) {
     if (loaded) { player.pause(); player.removeAttribute('src'); player.load(); }
-    loaded = ''; track = -1;
+    loaded = ''; track = -1; cued = false;
   } else if (!loaded.startsWith(`/api/sessions/${session.id}/audio/`)) {
+    cued = false;           // another transcript: nothing has been pointed at yet
     loadTrack(0, 0, false);
   }
 }
 
-function playFrom(t) {
+const LEAD = 0.15;        // start a touch early, so the first sound of a line is not clipped
+
+let cued = false;         // the user has pointed the player at a line of this transcript
+
+function playFrom(t, play = true) {
+  cued = true;
   const list = tracks();
   let index = 0;          // the last recording that starts at or before t
   list.forEach((item, i) => { if (item.offset <= t) index = i; });
-  loadTrack(index, Math.max(0, t - list[index].offset), true);
+  loadTrack(index, Math.max(0, t - LEAD - list[index].offset), play);
 }
 
 player.onplay = () => {
@@ -1044,18 +1061,21 @@ player.onended = () => {
   if (track + 1 < tracks().length) loadTrack(track + 1, 0, true);
 };
 
-player.ontimeupdate = () => {
+// Marks the line the player is at. A freshly opened transcript sits at the start
+// with nothing marked; once the user has clicked a line, the mark shows even there.
+function showPlaying() {
   const list = tracks();
   if (track < 0 || !list[track]) return;
   const now = list[track].offset + player.currentTime;
   let current = null;
   for (const row of document.querySelectorAll('.row[data-t]')) {
     const t = Number(row.dataset.t);
-    if (t >= list[track].offset - 0.05 && t <= now + 0.05) current = row;
+    if (t >= list[track].offset - 0.05 && t <= now + LEAD + 0.05) current = row;
     row.classList.remove('playing');
   }
-  if (current && (!player.paused || player.currentTime > 0)) current.classList.add('playing');
-};
+  if (current && (cued || !player.paused || player.currentTime > 0)) current.classList.add('playing');
+}
+player.ontimeupdate = showPlaying;
 
 // ------------------------------------------------------------- summary ---
 

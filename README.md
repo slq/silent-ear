@@ -26,7 +26,8 @@ anywhere unless you ask for a summary or choose a hosted transcription backend
 - **Device picker with level meters.** Choose the microphone and the output to record,
   and see at a glance whether each one delivers sound.
 - **Language switching** during a recording.
-- **Audio kept and playable.** Click a line's time to play from there.
+- **Audio kept and playable.** Click a line to move the player to it, or its time to
+  play from there straight away.
 - **Clean up** a transcript from its recording: a second pass in long pieces replaces the
   live lines, with better punctuation and fewer sentences cut in two. On demand, or
   automatically when a recording stops.
