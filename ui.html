@@ -759,8 +759,16 @@ function clock(t) {
   return new Date(Date.parse(session.started) + t * 1000).toLocaleTimeString([], { hour12: false });
 }
 
+let shownTranscript = null;   // which transcript the log last showed (its start time: ids change on rename)
+
 function renderTranscript() {
   const log = $('#log');
+  // The whole log is rebuilt on every change. When it is the same transcript, the reader
+  // must stay where they were, unless they were following the end of a live recording.
+  const same = Boolean(session) && shownTranscript === session.started;
+  const position = log.scrollTop;
+  const following = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+  shownTranscript = session ? session.started : null;
   log.replaceChildren();
   lastTurn = lastName = null;
   $('#head').style.visibility = session ? 'visible' : 'hidden';
@@ -770,7 +778,7 @@ function renderTranscript() {
   if (!session.entries.length) log.append(el('div', 'empty', 'Nothing transcribed yet.'));
   session.entries.forEach(appendEntry);
   showProvisional();
-  log.scrollTop = log.scrollHeight;
+  log.scrollTop = same && !following ? position : log.scrollHeight;
 }
 
 // Speech still being spoken: a grey line under the transcript, replaced by the
