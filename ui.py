@@ -251,6 +251,22 @@ def wav_seconds(path):
         return w.getnframes() / w.getframerate()
 
 
+def waveform_preview(path, bins=120):
+    """Sample short PCM windows for a bounded-cost overview of one audio track."""
+    peaks = []
+    with wave.open(path) as recording:
+        frames = recording.getnframes()
+        if recording.getsampwidth() != 2 or not frames:
+            return []
+        for index in range(min(frames, bins)):
+            start = index * frames // min(frames, bins)
+            recording.setpos(start)
+            samples = np.frombuffer(recording.readframes(min(256, frames - start)), "<i2")
+            peaks.append(int(np.abs(samples.astype(np.int32)).max()) if samples.size else 0)
+    scale = max(1, max(peaks))
+    return [round(peak / scale, 3) for peak in peaks]
+
+
 def wav_peak(path):
     """The loudest sample of a 16-bit WAV, 0..32767."""
     peak = 0
@@ -2282,6 +2298,9 @@ class App:
             return {"dictionary": self.dictionary.lists}
         if parts[:1] != ["sessions"]:
             raise KeyError("/".join(parts))
+
+        if method == "GET" and len(parts) == 4 and parts[2] == "waveform" and parts[3].isdigit():
+            return {"peaks": waveform_preview(store.audio_path(parts[1], int(parts[3])))}
 
         result = None
         if parts == ["sessions", "merge"] and method == "POST":

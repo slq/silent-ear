@@ -152,14 +152,83 @@
   #toast div + div { margin-top: 6px; padding-top: 6px; border-top: 1px solid rgb(127 127 127 / .4); }
   #toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: var(--ink);
            color: var(--bg); padding: 8px 14px; border-radius: 8px; max-width: 80vw; display: none; z-index: 10; }
+
+  :root { --bg:#fbfaf6; --panel:#fffefa; --sidebar:#edf0e8; --active:#dbe6d5; --ink:#202923; --accent:#195a3c; --muted:#58665d; --line:#d5dacf; --hover:#e7ece2; }
+  @media (prefers-color-scheme:dark) {
+    :root { --bg:#19201c; --panel:#222b25; --sidebar:#202822; --active:#344b3c; --ink:#eef1e9; --accent:#95d5ac; --muted:#b0bcb2; --line:#414d44; --hover:#2e3931; }
+  }
+  [hidden] { display:none !important; }
+  body { height:100dvh; grid-template: minmax(0,1fr) auto / clamp(230px,21vw,320px) minmax(0,1fr); }
+  aside { background:var(--sidebar); padding:18px 12px 0; }
+  .brand { display:flex; align-items:center; gap:10px; margin:0 6px 20px; font-size:23px; font-weight:750; letter-spacing:-.04em; }
+  .brand span { color:var(--accent); font-size:20px; }
+  .record-tools,.library-heading,.statusbar,.tabs,#transport { display:flex; align-items:center; gap:8px; }
+  #record,#export,#play-toggle { background:#155238; color:white; border-color:#155238; }
+  #record { flex:1; min-height:40px; }
+  #record.on { background:#a83932; border-color:#a83932; }
+  .menu { position:relative; }
+  .menu summary { list-style:none; border:1px solid var(--line); border-radius:7px; padding:7px 11px; cursor:pointer; background:var(--panel); }
+  .menu summary::-webkit-details-marker { display:none; }
+  .menu-panel { position:absolute; right:0; top:calc(100% + 5px); z-index:5; display:grid; gap:7px; padding:14px; width:max-content; max-width:90vw; border:1px solid var(--line); border-radius:10px; background:var(--panel); box-shadow:0 8px 24px #12201822; }
+  #settings .menu-panel { max-height:65dvh; overflow:auto; }
+  .menu-panel button { text-align:left; }
+  #search { margin:14px 0; padding:8px 10px; min-width:0; }
+  .library-heading { justify-content:space-between; padding:4px; }
+  #select-mode,.tabs button { background:none; }
+  #select-mode { font-size:12px; }
+  #sessions { padding:2px 0; }
+  #sessions li.date { font-size:12px; color:var(--muted); margin:10px 0 3px; cursor:default; background:transparent; }
+  #sessions li.open { background:var(--active); }
+  #sessions li:focus-within .del { visibility:visible; }
+  #sessions .title { font-weight:600; }
+  aside footer { padding:10px 0; }
+  main { --pad:clamp(14px,2.4vw,40px); }
+  #head { padding:18px var(--pad) 0; gap:5px 8px; }
+  .crumb,#facts { width:100%; color:var(--muted); font-size:13px; }
+  #title { font-size:clamp(20px,2.2vw,34px); padding:0; letter-spacing:-.035em; }
+  .tabs { width:100%; margin-top:10px; border-bottom:1px solid var(--line); }
+  .tabs button { border:0; border-radius:0; border-bottom:3px solid transparent; padding:8px 12px; }
+  .tabs [aria-pressed=true] { color:var(--accent); border-color:var(--accent); font-weight:700; }
+  #transport { margin:14px var(--pad) 0; padding:10px; border:1px solid var(--line); border-radius:10px; font-size:13px; font-variant-numeric:tabular-nums; }
+  #play-toggle { border-radius:50%; width:36px; height:36px; }
+  .timeline { flex:1; position:relative; min-width:36px; height:32px; }
+  #wave,#seek { width:100%; height:100%; position:absolute; inset:0; margin:0; }
+  #seek { opacity:0; cursor:pointer; }
+  .timeline:focus-within { outline:2px solid var(--accent); }
+  #volume { width:64px; accent-color:var(--accent); }
+  .mic-tag { font-size:11px; font-weight:600; background:var(--active); border-radius:5px; padding:1px 6px; }
+  #log { padding:0 var(--pad) 24px; }
+  .turn { margin-top:20px; }
+  .who { display:inline-flex; align-items:center; gap:12px; color:var(--ink); margin:0 0 4px; padding:0; }
+  .who::before { content:attr(data-initial); display:grid; place-items:center; width:30px; height:30px; border-radius:50%; background:hsl(var(--h) 32% 84%); color:#263429; }
+  .row { border:0; margin-left:40px; gap:12px; max-width:105ch; }
+  .row time { font:12px/1.5 ui-monospace,monospace; flex-basis:52px; }
+  #summary { flex:1; max-height:none; }
+  #summary-empty { margin:20px var(--pad); }
+  #live:empty,#cutbar:has(#cut-edit[hidden]) { display:none; }
+  .statusbar { grid-column:1/-1; padding:5px 14px; border-top:1px solid var(--line); background:var(--sidebar); color:var(--muted); font-size:12px; }
+  #status::before { content:'●'; color:var(--accent); margin-right:7px; }
+  @media (max-width:700px) {
+    body { grid-template:auto minmax(0,1fr) auto / minmax(0,1fr); }
+    aside { display:grid; grid-template-columns:1fr auto; gap:5px 10px; padding:8px 12px; border-bottom:1px solid var(--line); }
+    .brand,#search { margin:0; }
+    #sessions { grid-column:1/-1; max-height:15dvh; }
+    aside footer { display:flex; padding:2px 0; grid-column:1/-1; }
+    #volume,#meters { display:none; }
+    #transport { gap:4px; }
+    #head { padding-top:8px; }
+    .row { margin-left:0; }
+  }
 </style>
 </head>
 <body>
-<header>
-  <h1>Silent Ear</h1>
-  <button id="record" disabled>Loading…</button>
-  <span id="status"></span>
-  <label title="Tell apart the people sharing your microphone as Mic 1, Mic 2, … instead of calling them all You. Applies from the next recording.">
+<aside>
+  <div class="brand"><span aria-hidden="true">ı┃▏┃ı</span> Silent Ear</div>
+  <div class="record-tools">
+    <button id="record" disabled>Loading…</button>
+    <details class="menu" id="settings"><summary aria-label="Recording settings" title="Recording settings">⌄</summary>
+      <div class="menu-panel"><strong>Recording settings</strong>
+          <label title="Tell apart the people sharing your microphone as Mic 1, Mic 2, … instead of calling them all You. Applies from the next recording.">
     <input type="checkbox" id="mic-speakers"> Several people on my mic</label>
   <label title="Keep the recording as a WAV file next to the transcript (about 230 MB per hour with microphone and system audio). Applies from the next recording.">
     <input type="checkbox" id="save-audio"> Save audio</label>
@@ -167,42 +236,55 @@
     <input type="checkbox" id="auto-cleanup"> Clean up after recording</label>
   <label id="live-preview-label" title="Show grey provisional text while someone is still speaking; it is replaced by the final line when the sentence ends. Uses extra GPU time. Applies from the next recording.">
     <input type="checkbox" id="live-preview"> Text while speaking</label>
-  <span id="meters" title="Input level of each audio source"></span>
-  <button id="voices" title="Voices you have named: they are recognised in later recordings">Voices</button>
-  <button id="devices" title="Choose the microphone and the output to record, and check their levels">Devices</button>
-  <label>Language <select id="language"></select></label>
-  <button id="dictionary">Dictionary</button>
-</header>
 
-<aside>
+        <button id="devices" title="Choose the microphone and the output to record, and check their levels">Devices</button> <button id="voices" title="Voices you have named: they are recognised in later recordings">Voices</button> <button id="dictionary">Dictionary</button>
+      </div>
+    </details>
+  </div>
   <input id="search" type="search" placeholder="Search all transcripts…" aria-label="Search all transcripts"
          title="Finds lines, summaries and titles containing every word. Case and accents are ignored; a speaker's name counts as part of their lines.">
+  <div class="library-heading"><b>Transcripts</b><button id="select-mode" aria-pressed="false">Select</button></div>
   <ul id="sessions"></ul>
   <footer>
     <button id="import" title="Transcribe audio or video files (mp3, m4a, wav, mp4, mkv, webm, …). You can also drop files anywhere on this page.">Import audio or video…</button>
     <input id="import-files" type="file" accept="audio/*,video/*,.mkv,.m4a,.opus,.flac" multiple hidden>
-    <button id="join" disabled>Join selected</button>
+    <button id="join" hidden disabled>Join selected</button>
   </footer>
 </aside>
 
 <main>
   <div id="head">
+    <div class="crumb">Library &nbsp;/&nbsp; Recording</div>
     <input id="title" aria-label="Transcript title" placeholder="Name this transcript">
-    <button id="rename" title="Rename this transcript; the files are renamed to match">Rename</button>
     <select id="export" title="Save this transcript as a file" aria-label="Export this transcript">
       <option value="">Export…</option>
       <option value="md">Markdown (.md)</option>
       <option value="docx">Word (.docx)</option>
       <option value="srt">Subtitles (.srt)</option>
     </select>
-    <button id="summarise" title="Write a summary with decisions and action items. Sends the transcript text to the Anthropic API.">Summarise</button>
-    <button id="cleanup" hidden title="Transcribe the saved recording again in long pieces and replace these lines with the result: better punctuation, fewer sentences cut in two. Speaker names are kept.">Clean up</button>
-    <button id="replay" hidden title="Transcribe the saved recording again into a new transcript, with the language, dictionary and speaker settings selected now. This one stays as it is.">Re-transcribe</button>
-    <span id="file"></span>
+    <details class="menu" id="more"><summary aria-label="Recording actions" title="Recording actions">•••</summary>
+      <div class="menu-panel"><button id="rename" title="Rename this transcript; the files are renamed to match">Rename</button>
+        <button id="cleanup" hidden title="Transcribe the saved recording again in long pieces and replace these lines with the result: better punctuation, fewer sentences cut in two. Speaker names are kept.">Clean up</button>
+        <button id="replay" hidden title="Transcribe the saved recording again into a new transcript, with the language, dictionary and speaker settings selected now. This one stays as it is.">Re-transcribe</button>
+        <button id="cut-open" title="Remove a part of the recording together with the lines spoken in it">✂ Remove a part…</button></div>
+    </details>
+    <div id="facts"></div>
+    <div class="tabs" aria-label="Recording view">
+      <button id="transcript-view" aria-pressed="true">Transcript</button>
+      <button id="summary-view" aria-pressed="false">Summary</button>
+    </div>
+  </div>
+  <div id="transport" hidden>
+    <button id="play-toggle" aria-label="Play">▶</button>
+    <span id="elapsed">0:00</span>
+    <div class="timeline"><canvas id="wave" aria-hidden="true"></canvas><input id="seek" type="range" aria-label="Seek in current audio track" min="0" max="1" step="0.01" value="0"></div>
+    <span id="duration"></span>
+    <button id="mute" aria-label="Mute" aria-pressed="false">Volume</button>
+    <input id="volume" type="range" min="0" max="1" step="0.05" value="1" aria-label="Volume">
+    <select id="rate" aria-label="Playback speed"><option value="0.75" >0.75×</option><option value="1" selected>1×</option><option value="1.25" >1.25×</option><option value="1.5" >1.5×</option><option value="2" >2×</option></select>
   </div>
   <audio id="player" controls preload="metadata" hidden></audio>
   <div id="cutbar" hidden>
-    <button id="cut-open" title="Remove a part of the recording together with the lines spoken in it">✂ Remove a part…</button>
     <span id="cut-edit" hidden>
       Remove from
       <button id="cut-from" title="Set the start to where the player is now"></button>
@@ -213,6 +295,7 @@
       <button id="cut-cancel">Cancel</button>
     </span>
   </div>
+  <div id="summary-empty" hidden><p>Generate a summary with decisions and action items.</p><button id="summarise" title="Write a summary with decisions and action items. Sends the transcript text to the Anthropic API.">Summarise</button></div>
   <section id="summary" hidden>
     <div class="bar">
       <b>Summary</b>
@@ -228,6 +311,7 @@
   <div id="log"></div>
   <div id="live"></div>
 </main>
+<footer class="statusbar"><span id="status" role="status"></span><span id="meters" title="Input levels"></span><label>Language <select id="language"></select></label></footer>
 
 <dialog id="delete-dialog">
   <h2>Delete this line?</h2>
@@ -300,6 +384,23 @@ let state = null;         // /api/state
 let session = null;       // the open session, in full
 let openId = null;
 let picked = new Set();   // sessions ticked for joining
+let selecting = false;
+$('#select-mode').onclick = () => {
+  selecting = !selecting;
+  if (!selecting) picked.clear();
+  $('#select-mode').setAttribute('aria-pressed', String(selecting));
+  $('#select-mode').textContent = selecting ? 'Done' : 'Select';
+  if (state) renderSessions();
+};
+document.addEventListener('click', event => {
+  for (const menu of document.querySelectorAll('.menu[open]'))
+    if (!menu.contains(event.target) || event.target.closest('button')) menu.open = false;
+});
+document.addEventListener('keydown', event => {
+  if (event.key !== 'Escape') return;
+  const menu = document.querySelector('.menu[open]');
+  if (menu) { menu.open = false; menu.querySelector('summary').focus(); }
+});
 let editing = false;      // an inline edit is open: don't redraw under it
 let stale = false;
 let progress = null;
@@ -478,6 +579,13 @@ function renderBar() {
   }
   renderLive();
 }
+
+function recordingClock() {
+  if (state?.status.phase !== 'recording') return;
+  const active = state.sessions.find(item => item.id === state.status.session);
+  if (active) $('#record').textContent = '■ Stop  ' + clockOf((Date.now() - Date.parse(active.started)) / 1000);
+}
+setInterval(recordingClock, 1000);
 
 function renderLive() {
   const live = $('#live');
@@ -699,7 +807,8 @@ $('#search').onkeydown = event => {
 
 async function openHit(id, hit) {
   openId = id;
-  if (hit && hit.kind === 'summary') shownSummaries.add(id);
+  if (hit?.kind === 'summary') shownSummaries.add(id);
+  else shownSummaries.delete(id);
   await refresh();
   if (!hit || hit.kind !== 'line') return;
   const row = document.querySelector(`.row[data-id="${hit.entry}"]`);
@@ -740,10 +849,20 @@ function renderSessions() {
   list.replaceChildren();
   if (found) { renderFound(list); renderJoin(); return; }
   if (!state.sessions.length) list.append(el('li', 'empty', 'No transcripts yet. Press Record.'));
+  const today = new Date(), yesterday = new Date();
+  yesterday.setDate(today.getDate() - 1);
+  let previousDay = '';
   for (const s of state.sessions) {
+    const start = new Date(s.started), day = start.toDateString();
+    if (day !== previousDay) {
+      const label = day === today.toDateString() ? 'Today' : day === yesterday.toDateString() ? 'Yesterday' : start.toLocaleDateString();
+      list.append(el('li', 'date', label));
+      previousDay = day;
+    }
     const item = el('li', s.id === openId ? 'open' : '');
     const tick = el('input');
     tick.type = 'checkbox';
+    tick.hidden = !selecting;
     tick.checked = picked.has(s.id);
     tick.title = 'Select for joining';
     tick.onclick = event => event.stopPropagation();
@@ -760,6 +879,11 @@ function renderSessions() {
     });
     remove.className = 'del';
     item.append(tick, info, remove);
+    info.tabIndex = 0;
+    info.setAttribute('role', 'button');
+    info.onkeydown = event => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); item.click(); }
+    };
     item.onclick = () => { openId = s.id; refresh(); };
     list.append(item);
   }
@@ -768,6 +892,7 @@ function renderSessions() {
 
 function renderJoin() {
   const join = $('#join');
+  join.hidden = !selecting;
   join.disabled = picked.size < 2;
   join.textContent = picked.size < 2 ? 'Join selected' : `Join ${picked.size} selected`;
 }
@@ -806,11 +931,14 @@ function renderTranscript() {
   $('#head').style.visibility = session ? 'visible' : 'hidden';
   if (!session) { log.append(el('div', 'empty', 'Select a transcript, or press Record to start one.')); return; }
   if (document.activeElement !== $('#title')) $('#title').value = session.title;
-  $('#file').textContent = session.id + '.txt';
+  const speakers = state.sessions.find(item => item.id === session.id)?.speakers || [];
+  $('#facts').textContent = [new Date(session.started).toLocaleString([], {dateStyle:'medium', timeStyle:'short'}),
+    speakers.length + (speakers.length === 1 ? ' speaker' : ' speakers')].join('  ·  ');
+  $('#facts').title = session.id + '.txt';
   if (!session.entries.length) log.append(el('div', 'empty', 'Nothing transcribed yet.'));
   session.entries.forEach(appendEntry);
   showProvisional();
-  log.scrollTop = same && !following ? position : log.scrollHeight;
+  log.scrollTop = same && !following ? position : state.status.session === session.id ? log.scrollHeight : same ? position : 0;
 }
 
 // Speech still being spoken: a grey line under the transcript, replaced by the
@@ -840,6 +968,11 @@ function appendEntry(entry) {
     lastTurn.style.setProperty('--h', HUES[index % HUES.length]);
     if (name !== null) {
       const who = el('button', 'who', name);
+      if (/ \(mic\)$/i.test(name)) {
+        who.textContent = name.replace(/ \(mic\)$/i, '');
+        who.append(el('span', 'mic-tag', 'Mic'));
+      }
+      who.dataset.initial = Array.from(name.trim())[0] || '·';
       who.title = 'Rename this speaker everywhere in the transcript';
       who.onclick = () => renameSpeaker(who, entry.speaker);
       lastTurn.append(who);
@@ -864,12 +997,15 @@ function appendEntry(entry) {
     button('Delete', 'Delete this line', () => deleteLine(entry, base)),
   );
   text.ondblclick = () => editText(text, entry);
-  const time = el('time', '', clock(entry.t));
+  const time = el('time', '', entry.t == null ? '' : clockOf(entry.t));
   if (entry.t != null) {
     row.dataset.t = entry.t;
     if (playable()) {
       time.className = 'play';
-      time.title = 'Play the recording from here';
+      time.title = 'Play from ' + clock(entry.t);
+      time.tabIndex = 0;
+      time.setAttribute('role', 'button');
+      time.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); time.click(); } };
       time.onclick = event => { event.stopPropagation(); playFrom(entry.t); };
       // A click on the line moves the player to it without starting it: press play to
       // hear exactly this line. If it is already playing, it carries on from here.
@@ -1035,6 +1171,11 @@ function loadTrack(index, at, play) {
   track = index;
   if (loaded === url && player.readyState > 0) return start();
   loaded = url;
+  peaks = [];
+  drawWave();
+  api('GET', 'sessions/' + session.id + '/waveform/' + index, undefined, true)
+    .then(data => { if (loaded === url) { peaks = data.peaks; drawWave(); } })
+    .catch(() => {}); // Seeking still works with a plain progress line.
   player.src = url;
   player.addEventListener('loadedmetadata', start, { once: true });
 }
@@ -1059,7 +1200,7 @@ function renderPlayer() {
   $('#replay').disabled = state.status.phase !== 'idle';
   $('#cleanup').hidden = !playable();
   $('#cleanup').disabled = state.status.phase !== 'idle';
-  player.hidden = !playable();
+  $('#transport').hidden = !playable();
   if (!playable()) {
     if (loaded) { player.pause(); player.removeAttribute('src'); player.load(); }
     loaded = ''; track = -1; cued = false;
@@ -1114,7 +1255,7 @@ function renderCut() {
   const bar = $('#cutbar');
   bar.hidden = !playable();
   if (bar.hidden) cutRange = null;
-  $('#cut-open').hidden = Boolean(cutRange);
+  $('#cut-open').hidden = !playable() || Boolean(cutRange);
   $('#cut-edit').hidden = !cutRange;
   for (const row of document.querySelectorAll('.row.cutting')) row.classList.remove('cutting');
   if (!cutRange) return;
@@ -1134,7 +1275,7 @@ function renderCut() {
   $('#cut-do').disabled = !valid;
 }
 
-$('#cut-open').onclick = () => { cutRange = { from: playerPosition(), to: null }; renderCut(); };
+$('#cut-open').onclick = () => { $('#transcript-view').click(); cutRange = { from: playerPosition(), to: null }; renderCut(); };
 $('#cut-cancel').onclick = () => { cutRange = null; renderCut(); };
 $('#cut-from').onclick = () => { cutRange.from = playerPosition(); renderCut(); };
 $('#cut-to').onclick = () => { cutRange.to = playerPosition(); renderCut(); };
@@ -1195,6 +1336,49 @@ function showPlaying() {
   }
   if (current && (cued || !player.paused || player.currentTime > 0)) current.classList.add('playing');
 }
+let peaks = [];
+const wave = $('#wave');
+function drawWave() {
+  const width = Math.round(wave.clientWidth), height = 32;
+  if (!width) return;
+  wave.width = width;
+  wave.height = height;
+  const ctx = wave.getContext('2d');
+  const style = getComputedStyle(wave);
+  const fraction = player.duration ? player.currentTime / player.duration : 0;
+  const count = peaks.length || 100;
+  for (let i = 0; i < count; i++) {
+    const h = Math.max(3, Math.sqrt(peaks[i] || 0) * height);
+    ctx.fillStyle = style.getPropertyValue(i / count <= fraction ? '--accent' : '--line');
+    ctx.fillRect(width * i / count, (height-h)/2, Math.max(1,width/count-2), h);
+  }
+}
+function syncTransport() {
+  const length = Number.isFinite(player.duration) ? player.duration : 0;
+  $('#elapsed').textContent = clockOf(player.currentTime || 0);
+  $('#duration').textContent = clockOf(length);
+  $('#seek').max = length || 1;
+  $('#seek').disabled = !length;
+  $('#seek').value = player.currentTime || 0;
+  $('#seek').setAttribute('aria-valuetext', $('#elapsed').textContent);
+  const paused = player.paused;
+  $('#play-toggle').textContent = paused ? '▶' : 'Ⅱ';
+  $('#play-toggle').setAttribute('aria-label', paused ? 'Play' : 'Pause');
+  drawWave();
+}
+for (const event of ['loadedmetadata','timeupdate','play','pause','emptied'])
+  player.addEventListener(event, syncTransport);
+new ResizeObserver(drawWave).observe(wave);
+$('#play-toggle').onclick = () => player.paused ? player.play().catch(e => toast(e.message)) : player.pause();
+$('#seek').oninput = event => { player.currentTime = Number(event.target.value); cued = true; showPlaying(); };
+$('#volume').oninput = event => { player.volume = Number(event.target.value); player.muted = false; };
+$('#mute').onclick = () => { player.muted = !player.muted; };
+player.onvolumechange = () => {
+  $('#mute').setAttribute('aria-pressed', String(player.muted));
+  $('#mute').textContent = player.muted ? 'Muted' : 'Volume';
+  $('#volume').value = player.muted ? 0 : player.volume;
+};
+$('#rate').onchange = event => { player.defaultPlaybackRate = player.playbackRate = Number(event.target.value); };
 player.ontimeupdate = showPlaying;
 
 // ------------------------------------------------------------- summary ---
@@ -1241,10 +1425,13 @@ function renderSummary() {
   const box = $('#summary'), button = $('#summarise');
   const running = summarising();
   const saved = session && session.summary;
-  button.hidden = !session;
-  button.disabled = running || !session || !session.entries.length;
-  button.textContent = running ? 'Summarising…' : saved ? (shownSummaries.has(session.id) ? 'Hide summary' : 'Summary') : 'Summarise';
-  box.hidden = !(running || (saved && shownSummaries.has(session.id)));
+  const selected = Boolean(session && shownSummaries.has(session.id));
+  $('#log').hidden = selected;
+  $('#summary-view').setAttribute('aria-pressed', String(selected));
+  $('#transcript-view').setAttribute('aria-pressed', String(!selected));
+  $('#summary-empty').hidden = !selected || running || Boolean(saved);
+  button.disabled = !session || !session.entries.length;
+  box.hidden = !selected || !(running || saved);
   if (box.hidden) return;
   for (const id of ['#summary-copy', '#summary-redo', '#summary-remove']) $(id).disabled = running;
   if (running) {
@@ -1273,14 +1460,9 @@ async function writeSummary() {
   await act('POST', `sessions/${session.id}/summary`);
 }
 
-$('#summarise').onclick = () => {
-  if (session.summary) {
-    shownSummaries.has(session.id) ? shownSummaries.delete(session.id) : shownSummaries.add(session.id);
-    renderSummary();
-  } else {
-    writeSummary();
-  }
-};
+$('#summary-view').onclick = () => { if (session) { shownSummaries.add(session.id); renderSummary(); } };
+$('#transcript-view').onclick = () => { if (session) { shownSummaries.delete(session.id); renderSummary(); } };
+$('#summarise').onclick = writeSummary;
 $('#summary-hide').onclick = () => { shownSummaries.delete(session.id); renderSummary(); };
 $('#summary-redo').onclick = writeSummary;
 $('#summary-remove').onclick = () => { if (confirm('Delete this summary?')) act('DELETE', `sessions/${session.id}/summary`); };
