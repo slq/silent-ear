@@ -20,6 +20,9 @@ anywhere unless you ask for a summary or choose a hosted transcription backend
   that person from the start.
 - **Editing.** Fix a line, join lines, reassign a line to another speaker, join or
   remove whole transcripts. Removed transcripts go to a trash folder.
+- **Removing parts.** Delete a line together with its audio, or mark a part of the
+  recording by ear and remove it with the lines spoken in it. The rest closes up, and
+  the original recording is kept once in the trash folder.
 - **Dictionary** of preferred spellings per language (company names, jargon). Terms are
   given to the model as a hint, and listed mishearings are always replaced.
 - **Search** across all transcripts, summaries and titles, ignoring case and accents.

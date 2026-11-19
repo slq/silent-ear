@@ -103,6 +103,13 @@
   .row.playing { background: hsl(var(--h) 60% 55% / .16); }
   #provisional { margin: 10px 0 0 64px; color: var(--muted); font-style: italic; overflow-wrap: anywhere; }
   #provisional::after { content: " …"; }
+  #cutbar { margin: 0 20px 2px; font-size: 13px; color: var(--muted); flex: none; }
+  #cutbar[hidden], #cut-edit[hidden] { display: none; }
+  #cutbar button { font-size: 12px; padding: 1px 8px; }
+  #cut-from, #cut-to { font-variant-numeric: tabular-nums; min-width: 52px; }
+  #cut-info { margin: 0 6px; }
+  .row.cutting { background: hsl(4 75% 55% / .14); }
+  .row.cutting .text { text-decoration: line-through; text-decoration-color: hsl(4 75% 55% / .6); }
   .row.seekable .text { cursor: pointer; }
   .row.seekable .text[contenteditable] { cursor: text; }
   .row time.play { cursor: pointer; }
@@ -194,6 +201,18 @@
     <span id="file"></span>
   </div>
   <audio id="player" controls preload="metadata" hidden></audio>
+  <div id="cutbar" hidden>
+    <button id="cut-open" title="Remove a part of the recording together with the lines spoken in it">✂ Remove a part…</button>
+    <span id="cut-edit" hidden>
+      Remove from
+      <button id="cut-from" title="Set the start to where the player is now"></button>
+      to
+      <button id="cut-to" title="Set the end to where the player is now"></button>
+      <span id="cut-info"></span>
+      <button id="cut-do" class="primary">Remove</button>
+      <button id="cut-cancel">Cancel</button>
+    </span>
+  </div>
   <section id="summary" hidden>
     <div class="bar">
       <b>Summary</b>
@@ -209,6 +228,19 @@
   <div id="log"></div>
   <div id="live"></div>
 </main>
+
+<dialog id="delete-dialog">
+  <h2>Delete this line?</h2>
+  <p id="delete-text"></p>
+  <p>Deleting the audio as well cuts this stretch out of the recording and moves everything after it
+     earlier. The original recording is kept once in the trash folder.</p>
+  <div class="bar">
+    <button id="delete-both" class="primary"></button>
+    <button id="delete-line">Line only</button>
+    <span class="spacer"></span>
+    <button id="delete-cancel">Cancel</button>
+  </div>
+</dialog>
 
 <dialog id="voice-dialog">
   <h2>Voices</h2>
@@ -829,7 +861,7 @@ function appendEntry(entry) {
     button('Edit', 'Edit the text (Enter saves, Esc cancels)', () => editText(text, entry)),
     join,
     speakerPicker(entry, base),
-    button('Delete', 'Delete this line', () => { if (confirm('Delete this line?')) act('DELETE', base); }),
+    button('Delete', 'Delete this line', () => deleteLine(entry, base)),
   );
   text.ondblclick = () => editText(text, entry);
   const time = el('time', '', clock(entry.t));
@@ -996,7 +1028,9 @@ function playable() {     // not while it is still being recorded into
 }
 
 function loadTrack(index, at, play) {
-  const url = `/api/sessions/${session.id}/audio/${index}`;
+  // The address changes whenever a part is removed, or the browser would go on
+  // playing the copy of the recording it already holds.
+  const url = `/api/sessions/${session.id}/audio/${index}?v=${session.cut_seconds || 0}`;
   const start = () => { player.currentTime = at; showPlaying(); if (play) player.play(); };
   track = index;
   if (loaded === url && player.readyState > 0) return start();
@@ -1034,6 +1068,84 @@ function renderPlayer() {
     loadTrack(0, 0, false);
   }
 }
+
+// ------------------------------------------------ removing parts of a recording ---
+
+const clockOf = seconds => {
+  const s = Math.max(0, Math.round(seconds));
+  return (s >= 3600 ? Math.floor(s / 3600) + ':' + String(Math.floor(s / 60) % 60).padStart(2, '0') : Math.floor(s / 60)) + ':' + String(s % 60).padStart(2, '0');
+};
+
+// A line with a recording behind it can go alone, or together with its audio.
+function deleteLine(entry, base) {
+  if (!playable() || entry.t == null) {
+    if (confirm('Delete this line?')) act('DELETE', base);
+    return;
+  }
+  const later = session.entries.map(e => e.t).filter(t => t != null && t > entry.t);
+  const length = later.length ? Math.min(...later) - entry.t : null;
+  $('#delete-text').textContent = '“' + (entry.text.length > 160 ? entry.text.slice(0, 160) + '…' : entry.text) + '”';
+  $('#delete-both').textContent = 'Line and its audio' + (length != null ? ` (${clockOf(length)})` : '');
+  const dialog = $('#delete-dialog');
+  $('#delete-cancel').onclick = () => dialog.close();
+  $('#delete-line').onclick = () => { dialog.close(); act('DELETE', base); };
+  $('#delete-both').onclick = async () => {
+    dialog.close();
+    await cutAndReload(base + '/cut', undefined, entry.t);
+  };
+  dialog.showModal();
+}
+
+async function cutAndReload(path, body, at) {
+  player.pause();
+  const result = await api('POST', path, body || {});
+  loaded = '';                      // the file changed: the player must fetch it again
+  await refresh();
+  if (playable()) playFrom(Math.min(at, 1e9), false);
+  toast(`Removed ${clockOf(result.seconds)} of the recording` + (result.lines ? ` and ${result.lines} line${result.lines === 1 ? '' : 's'}.` : '.'));
+}
+
+// Marking a part of the recording by ear: start and end are set to where the player is.
+let cutRange = null;      // { from, to } on the session's timeline, while the bar is open
+
+const playerPosition = () => (track >= 0 && tracks()[track] ? tracks()[track].offset + player.currentTime : 0);
+
+function renderCut() {
+  const bar = $('#cutbar');
+  bar.hidden = !playable();
+  if (bar.hidden) cutRange = null;
+  $('#cut-open').hidden = Boolean(cutRange);
+  $('#cut-edit').hidden = !cutRange;
+  for (const row of document.querySelectorAll('.row.cutting')) row.classList.remove('cutting');
+  if (!cutRange) return;
+  const { from, to } = cutRange;
+  $('#cut-from').textContent = clockOf(from);
+  $('#cut-to').textContent = to == null ? 'set end' : clockOf(to);
+  const valid = to != null && to - from >= 0.1;
+  let lines = 0;
+  if (valid) {
+    for (const row of document.querySelectorAll('.row[data-t]')) {
+      const t = Number(row.dataset.t);
+      if (t >= from && t < to) { row.classList.add('cutting'); lines++; }
+    }
+  }
+  $('#cut-info').textContent = valid ? `${clockOf(to - from)} long · ${lines} line${lines === 1 ? '' : 's'}`
+    : to == null ? 'Play or click to where the part ends, then press “set end”.' : 'The end must be after the start.';
+  $('#cut-do').disabled = !valid;
+}
+
+$('#cut-open').onclick = () => { cutRange = { from: playerPosition(), to: null }; renderCut(); };
+$('#cut-cancel').onclick = () => { cutRange = null; renderCut(); };
+$('#cut-from').onclick = () => { cutRange.from = playerPosition(); renderCut(); };
+$('#cut-to').onclick = () => { cutRange.to = playerPosition(); renderCut(); };
+$('#cut-do').onclick = async () => {
+  const { from, to } = cutRange;
+  const lines = document.querySelectorAll('.row.cutting').length;
+  if (!confirm(`Remove ${clockOf(to - from)} of the recording, from ${clockOf(from)} to ${clockOf(to)}, and the ${lines} line${lines === 1 ? '' : 's'} in it?\n\n` +
+               'Everything after it moves earlier. The original recording is kept once in the trash folder.')) return;
+  cutRange = null;
+  await cutAndReload(`sessions/${session.id}/cut`, { from, to }, from);
+};
 
 const LEAD = 0.15;        // start a touch early, so the first sound of a line is not clipped
 
@@ -1186,6 +1298,7 @@ function render() {
   renderSessions();
   renderTranscript();
   renderPlayer();
+  renderCut();
   renderSummary();
 }
 

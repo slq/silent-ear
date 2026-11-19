@@ -81,6 +81,8 @@ ABOUT = (
     "'source_file', when set, is the audio or video file this transcript was imported from; "
     "'started' is then an estimate (the file's date minus its length) and every voice is on the "
     "single channel 'uploaded file'. "
+    "'removed_seconds' is how much the user has cut out of the recording and the transcript; "
+    "times after a cut are earlier than the real ones by what was removed before them. "
     "'summary', when present, was written by a language model from an earlier state of this "
     "transcript; the entries are the source of truth."
 )
@@ -213,6 +215,40 @@ def _decode_to_wav(source, target, progress):
                 w.writeframesraw(data)
                 samples += len(data) // 2
     return samples / core.SR
+
+
+def cut_wav(path, start_s, end_s):
+    """Remove [start_s, end_s) from a WAV file. The shortened recording is
+    written beside the file and swapped in, so the file is never half-written
+    and other names for the same data (hard links) keep the original."""
+    with wave.open(path) as source:
+        rate, total = source.getframerate(), source.getnframes()
+        first = max(0, min(total, int(round(start_s * rate))))
+        last = max(first, min(total, int(round(end_s * rate))))
+        with wave.open(path + ".part", "wb") as target:
+            target.setnchannels(source.getnchannels())
+            target.setsampwidth(source.getsampwidth())
+            target.setframerate(rate)
+            for begin, stop in ((0, first), (last, total)):
+                source.setpos(begin)
+                left = stop - begin
+                while left > 0:
+                    block = source.readframes(min(left, 1 << 18))
+                    if not block:
+                        break
+                    target.writeframesraw(block)
+                    left -= 1 << 18
+    try:
+        os.replace(path + ".part", path)
+    except OSError:
+        os.remove(path + ".part")
+        raise Busy("The recording is in use. Pause playback and try again.")
+    return (last - first) / rate
+
+
+def wav_seconds(path):
+    with wave.open(path) as w:
+        return w.getnframes() / w.getframerate()
 
 
 def wav_peak(path):
@@ -349,6 +385,7 @@ def new_session(sid, started, title=None, model=None, sources=None, source_file=
             "started": started.isoformat(timespec="seconds"),
             "model": model, "sources": sources, "source_file": source_file, "audio": [],
             "summary": None, "cleaned": None,
+            "cut_seconds": 0,           # how much the user has removed from the recording
             # Voice labels the user merged into another speaker: while a recording runs, the
             # detector keeps handing out the old label, and new lines must follow the merge.
             "aliases": {},
@@ -658,6 +695,7 @@ def to_file(session, dictionary=None):
         "glossary": dictionary.glossary(languages) if dictionary else [],
         "summary": session.get("summary"),
         "cleaned_up": session.get("cleaned"),
+        "removed_seconds": session.get("cut_seconds") or 0,
         "merged_voice_labels": session.get("aliases") or {},
         "speakers": speakers,
         "entries": entries,
@@ -681,6 +719,7 @@ def from_file(data):
     if isinstance(data.get("summary"), dict) and data["summary"].get("text"):
         session["summary"] = data["summary"]
     session["cleaned"] = data.get("cleaned_up")
+    session["cut_seconds"] = data.get("removed_seconds") or 0
     if isinstance(data.get("merged_voice_labels"), dict):
         session["aliases"] = {str(k): str(v) for k, v in data["merged_voice_labels"].items()}
     for item in data.get("audio") or []:
@@ -966,6 +1005,88 @@ class Store:
         aliases[source] = target
         aliases.pop(target, None)
         session["names"].pop(source, None)
+
+    def _keep_original(self, name):
+        """Before a recording is cut for the first time, keep it in the trash folder.
+        A hard link where possible: the cut writes a new file, so the link keeps the
+        whole original at no extra cost until then."""
+        bin_dir = os.path.join(self.dir, "trash")
+        os.makedirs(bin_dir, exist_ok=True)
+        stem, ext = os.path.splitext(name)
+        backup = os.path.join(bin_dir, f"{stem}.before-cuts{ext}")
+        if not os.path.exists(backup):
+            try:
+                os.link(os.path.join(self.dir, name), backup)
+            except OSError:
+                shutil.copyfile(os.path.join(self.dir, name), backup)
+
+    def cut(self, sid, start, end):
+        """Remove the stretch [start, end) (seconds since the session began) from
+        the recording and from the transcript, and close the gap: lines inside it
+        go, lines after it move earlier by its length, and so does the audio.
+
+        Returns (session, lines removed, seconds removed). Clock times after the
+        cut are earlier than they really were; cut_seconds keeps the total.
+        """
+        with self.lock:
+            session = self.load(sid)
+            start, end = max(0.0, float(start)), float(end)
+            if end - start < 0.05:
+                raise ValueError("That part is too short to remove.")
+            length = end - start
+            kept = []
+            for item in session["audio"]:
+                path = os.path.join(self.dir, item["file"])
+                if not os.path.isfile(path):
+                    kept.append(item)
+                    continue
+                begins, lasts = item["offset"], item["offset"] + wav_seconds(path)
+                if lasts <= start:                      # entirely before: untouched
+                    kept.append(item)
+                elif begins >= end:                     # entirely after: moves earlier
+                    item["offset"] = round(begins - length, 3)
+                    kept.append(item)
+                elif begins >= start and lasts <= end:  # entirely inside: the whole file goes
+                    self._keep_original(item["file"])
+                    os.remove(path)
+                else:
+                    self._keep_original(item["file"])
+                    cut_wav(path, start - begins, end - begins)
+                    item["offset"] = round(min(begins, start), 3)
+                    kept.append(item)
+            session["audio"] = kept
+            removed, entries = 0, []
+            for entry in session["entries"]:
+                t = entry["t"]
+                if t is not None and start <= t < end:
+                    removed += 1
+                    continue
+                if t is not None and t >= end:
+                    entry["t"] = round(t - length, 1)
+                    if entry.get("end") is not None:
+                        entry["end"] = round(entry["end"] - length, 1)
+                elif t is not None and entry.get("end") is not None and entry["end"] > start:
+                    entry["end"] = round(start, 1)      # it ran into the part that is gone
+                entries.append(entry)
+            session["entries"] = entries
+            session["cut_seconds"] = round(session.get("cut_seconds", 0) + length, 1)
+            self.save(session)
+            return session, removed, length
+
+    def line_span(self, sid, eid):
+        """The stretch a line occupies: from its start to the start of the next line
+        (so the pause after it goes too), or to its own end when it is the last."""
+        session = self.load(sid)
+        _, entry = self._entry(session, eid)
+        if entry["t"] is None:
+            raise ValueError("This line has no position in the recording.")
+        later = [e["t"] for e in session["entries"] if e["t"] is not None and e["t"] > entry["t"]]
+        if later:
+            return entry["t"], min(later)
+        ends = [a["offset"] + wav_seconds(os.path.join(self.dir, a["file"])) for a in session["audio"]
+                if os.path.isfile(os.path.join(self.dir, a["file"]))]
+        end = max(ends) if ends else entry.get("end") or entry["t"] + len(entry["text"]) / 14 + 1.0
+        return entry["t"], max(end, entry["t"] + 0.1)
 
     def merge_speakers(self, sid, source, target):
         """Fold one speaker into another: for a voice the detection split in two."""
@@ -2187,6 +2308,17 @@ class App:
             return {}
         elif len(parts) == 3 and parts[2] == "summary" and method == "DELETE":
             result = store.set_summary(parts[1], None)
+        elif len(parts) == 3 and parts[2] == "cut" and method == "POST":
+            # Remove a stretch of the recording together with the lines in it.
+            self._not_recording([parts[1]])
+            session, lines, seconds = store.cut(parts[1], body.get("from", 0), body.get("to", 0))
+            result = {"session": session, "lines": lines, "seconds": round(seconds, 1)}
+        elif len(parts) == 5 and parts[2] == "entries" and parts[3].isdigit() and parts[4] == "cut" and method == "POST":
+            # Delete one line together with its audio.
+            self._not_recording([parts[1]])
+            start, end = store.line_span(parts[1], int(parts[3]))
+            session, lines, seconds = store.cut(parts[1], start, end)
+            result = {"session": session, "lines": lines, "seconds": round(seconds, 1)}
         elif len(parts) == 4 and parts[2:] == ["speakers", "merge"] and method == "POST":
             target = str(body.get("into", ""))
             result = store.merge_speakers(parts[1], str(body.get("from", "")), target)
